@@ -1,6 +1,6 @@
 {
   "name": "hongguo-downloader",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "红果短剧全集批量下载器（Windows 桌面版）",
   "main": "main.js",
   "license": "GPL-3.0",
@@ -93,7 +93,8 @@
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "红果短剧下载器",
-      "artifactName": "${productName}-Setup-${version}.${ext}"
+      "artifactName": "${productName}-Setup-${version}.${ext}",
+      "include": "build/installer.nsh"
     }
   }
 }

@@ -101,7 +101,7 @@ function DownloadManager({ onNavigate }) {
     const cleanups = [
       window.electronAPI.onDownloadProgress((data) => {
         setTasks((prev) =>
-          prev.map((t) => (t.id === data.id ? { ...t, progress: data.progress, receivedBytes: data.receivedBytes, totalBytes: data.totalBytes, status: 'downloading' } : t))
+          prev.map((t) => (t.id === data.id ? { ...t, progress: data.progress, receivedBytes: data.receivedBytes, totalBytes: data.totalBytes, status: 'downloading', error: data.message !== undefined ? data.message : t.error } : t))
         );
       }),
       window.electronAPI.onDownloadTaskAdded(() => refresh()),
@@ -554,7 +554,7 @@ function DownloadManager({ onNavigate }) {
                     {task.status === 'downloading' && task.totalBytes > 0 && (
                       <span className="dm-size">{fmtBytes(task.receivedBytes)} / {fmtBytes(task.totalBytes)}</span>
                     )}
-                    {task.status === 'failed' && task.error && <span className="dm-error">{task.error}</span>}
+                    {task.error && <span className="dm-error">{task.error}</span>}
                   </div>
                   {(task.status === 'downloading' || task.status === 'pending') && (
                     <div className="dm-progress">

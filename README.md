@@ -395,3 +395,40 @@ Chromium 对超长 HEVC 视频的 seek 支持有限。合并文件本身是完�
 
 > 内置的 FFmpeg 构建参数含 `--enable-gpl --enable-version3`，因此其许可证为 GPLv3。
 > 本软件仅通过命令行调用其公开接口，未修改 FFmpeg 源码。
+
+---
+
+## 本仓库说明
+
+本仓库基于 [zhenyong97/hongguo-downloader](https://github.com/zhenyong97/hongguo-downloader) v1.1.0 的源码构建，
+上游功能全部保留，只针对下面两个问题做了修复。
+
+### 1. 下载卡死自动恢复（不再需要手动「暂停 → 启动」）
+
+播放直链是 CDN 长连接流，服务端停止推数据时**不会主动断开连接**。原实现只等 `writer` 的
+`finish`/`error` 事件，因此任务会永远停在同一个百分比，失败后也不会重试。
+
+现在：
+
+- **卡死看门狗**：超过 25 秒没有任何数据到达即判定卡死，中断连接并自动重试。
+- **自动重试**：每个任务最多自动重试 3 次，且**每次重试都重新获取带签名的播放直链**
+  （直链会过期，这正是「暂停再启动就好了」的原因）。
+- **不完整检测**：服务端声明了 `content-length` 却提前断流，同样按失败处理并重试。
+- 在线播放的缓存取流（`fetchDecryptedEpisode`）也加了同样的看门狗与重试。
+
+### 2. 安装/升级不再被残留进程挡住
+
+安装器原先在结束不掉进程时只弹「无法关闭」，导致文件没被替换、旧进程继续运行，
+看起来就像「版本号没更新」。现在安装器与卸载器都会强制结束残留的
+「红果短剧下载器」进程（含 Electron 子进程）后再继续。
+
+### 构建
+
+```bash
+npm ci
+node scripts/setup-ffmpeg.js        # 拉取内置 ffmpeg（仓库不含二进制，约 88MB）
+npm run build:react
+npx electron-builder --win --x64    # 输出 dist/红果短剧下载器-Setup-<版本>.exe
+```
+
+推 tag（如 `v1.1.1`）会由 GitHub Actions 自动构建并发布到 Releases。

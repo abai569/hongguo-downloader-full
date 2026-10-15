@@ -474,131 +474,223 @@ async function executeDownload(task) {
 }
 
 // ===== 红果短剧下载 =====
+// 播放直链是 CDN 长连接流：服务端停止推数据时并不会断开连接，
+// 没有看门狗的话 writer 永远等不到 finish，任务会一直卡在同一个百分比。
+const DOWNLOAD_IDLE_TIMEOUT_MS = 25000;
+// 每个任务自动重试次数；每次重试都重新获取带签名的播放直链（直链会过期）
+const DOWNLOAD_MAX_ATTEMPTS = 3;
+
+function delay(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 async function executeHongguoDownload(task) {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= DOWNLOAD_MAX_ATTEMPTS; attempt++) {
+    if (task.cancelled) {
+      markTaskStopped(task);
+      return;
+    }
+    try {
+      await downloadHongguoEpisode(task, attempt);
+      return;
+    } catch (error) {
+      lastError = error;
+      delete task.cancelSource;
+      delete task.writer;
+      if (task.cancelled) {
+        markTaskStopped(task);
+        return;
+      }
+      const message = (error && error.message) || String(error);
+      const info = task.hongguoInfo || {};
+      console.warn(`[Hongguo] 《${info.series_title || ''}》第${info.vid_index || ''}集 第 ${attempt}/${DOWNLOAD_MAX_ATTEMPTS} 次失败: ${message}`);
+      if (attempt < DOWNLOAD_MAX_ATTEMPTS) {
+        task.error = `第 ${attempt} 次失败（${message}），正在自动重试…`;
+        sendToRenderer('download-progress', {
+          id: task.id,
+          progress: task.progress || 0,
+          receivedBytes: task.receivedBytes || 0,
+          totalBytes: task.totalBytes || 0,
+          message: task.error,
+        });
+        await delay(1200 * attempt);
+      }
+    }
+  }
+
+  const reason = (lastError && lastError.message) || '未知错误';
+  task.status = 'failed';
+  task.error = `已自动重试 ${DOWNLOAD_MAX_ATTEMPTS} 次仍失败：${reason}`;
+  task.endTime = Date.now();
+  saveDownloadTasks();
+  console.error(`[Hongguo] 放弃下载: ${reason}`);
+  sendToRenderer('download-failed', { id: task.id, error: task.error });
+}
+
+function markTaskStopped(task) {
+  if (task.savePath) {
+    const tmp = task.savePath + '.enc.tmp';
+    if (fs.existsSync(tmp)) { try { fs.unlinkSync(tmp); } catch (_) {} }
+  }
+  task.status = 'stopped';
+  task.endTime = Date.now();
+  saveDownloadTasks();
+  sendToRenderer('download-stopped', { id: task.id });
+}
+
+async function downloadHongguoEpisode(task, attempt) {
   const { id, hongguoInfo, filename } = task;
   const { vid, series_title, vid_index } = hongguoInfo || {};
 
+  console.log(`[Hongguo] 开始下载《${series_title}》第${vid_index}集（第 ${attempt} 次尝试）:`, vid);
+  task.status = 'downloading';
+  task.progress = 0;
+  task.receivedBytes = 0;
+  task.totalBytes = 0;
+  task.error = '';
+  sendToRenderer('download-progress', { id, progress: 0, receivedBytes: 0, totalBytes: 0, message: '' });
+
+  // 1. 获取播放直链与 spade_a 加密信息（官网兜底时 spadeA 为空，直链为明文 MP4）
+  const playInfo = await hongguo.fetchPlayUrlSingle(vid, hongguoInfo && hongguoInfo.series_id);
+  if (!playInfo || !playInfo.url) {
+    throw new Error('未获取到有效播放地址');
+  }
+
+  // 2. 下载目录
+  const settings = getCurrentSettings();
+  const root = (settings.root && String(settings.root).trim()) ? String(settings.root).trim() : app.getPath('downloads');
+  const seriesFolder = sanitizeFolderName(series_title) || '未命名短剧';
+  const downloadDir = task.customDir || path.join(root, '红果短剧', seriesFolder);
+  fs.mkdirSync(downloadDir, { recursive: true });
+
+  const finalPath = task.savePath || path.join(downloadDir, filename);
+  task.savePath = finalPath;
+
+  // 目标已存在且大小合格，跳过重下
+  if (fs.existsSync(finalPath) && fs.statSync(finalPath).size > 1024 * 100) {
+    console.log('[Hongguo] 文件已存在，直接完成:', finalPath);
+    task.status = 'completed';
+    task.progress = 100;
+    task.error = '';
+    task.endTime = Date.now();
+    saveDownloadTasks();
+    sendToRenderer('download-completed', { id, path: finalPath });
+    return;
+  }
+
+  const tmpPath = finalPath + '.enc.tmp';
+  if (fs.existsSync(tmpPath)) {
+    try { fs.unlinkSync(tmpPath); } catch (_) {}
+  }
+
+  // 3. HTTP 流式下载（带"长时间无数据"看门狗）
+  const CancelToken = axios.CancelToken;
+  const source = CancelToken.source();
+  task.cancelSource = source;
+
+  const headers = { "User-Agent": hongguo.UA };
+  const request = (extra) => axios({
+    method: 'GET', url: playInfo.url, responseType: 'stream',
+    headers: { ...extra }, timeout: 60000, cancelToken: source.token,
+  });
+
+  let response;
   try {
-    console.log(`[Hongguo] 开始下载《${series_title}》第${vid_index}集:`, vid);
-    task.status = 'downloading';
-    task.progress = 0;
-    sendToRenderer('download-progress', { id, progress: 0, receivedBytes: 0, totalBytes: 0 });
-
-    // 1. 获取播放直链与 spade_a 加密信息（官网兜底时 spadeA 为空，直链为明文 MP4）
-    const playInfo = await hongguo.fetchPlayUrlSingle(vid, hongguoInfo && hongguoInfo.series_id);
-    if (!playInfo || !playInfo.url) {
-      throw new Error('未获取到有效播放地址');
+    response = await request(headers);
+  } catch (err) {
+    if (err.response && err.response.status === 403) {
+      response = await request({ ...headers, Referer: hongguo.VIDEO_REFERER });
+    } else {
+      throw err;
     }
+  }
 
-    // 2. 下载目录
-    const settings = getCurrentSettings();
-    const root = (settings.root && String(settings.root).trim()) ? String(settings.root).trim() : app.getPath('downloads');
-    const seriesFolder = sanitizeFolderName(series_title) || '未命名短剧';
-    const downloadDir = task.customDir || path.join(root, '红果短剧', seriesFolder);
-    fs.mkdirSync(downloadDir, { recursive: true });
+  const totalLength = parseInt(response.headers['content-length'], 10) || 0;
+  task.totalBytes = totalLength;
 
-    const finalPath = task.savePath || path.join(downloadDir, filename);
-    task.savePath = finalPath;
+  const writer = fs.createWriteStream(tmpPath);
+  task.writer = writer;
 
-    // 目标已存在且大小合格，跳过重下
-    if (fs.existsSync(finalPath) && fs.statSync(finalPath).size > 1024 * 100) {
-      console.log('[Hongguo] 文件已存在，直接完成:', finalPath);
-      task.status = 'completed';
-      task.progress = 100;
-      task.endTime = Date.now();
-      saveDownloadTasks();
-      sendToRenderer('download-completed', { id, path: finalPath });
-      return;
-    }
-
-    const tmpPath = finalPath + '.enc.tmp';
-
-    // 3. HTTP 流式下载
-    const CancelToken = axios.CancelToken;
-    const source = CancelToken.source();
-    task.cancelSource = source;
-
-    let headers = { "User-Agent": hongguo.UA };
-    let response;
-    try {
-      response = await axios({
-        method: 'GET', url: playInfo.url, responseType: 'stream',
-        headers, timeout: 60000, cancelToken: source.token,
-      });
-    } catch (err) {
-      if (err.response && err.response.status === 403) {
-        headers["Referer"] = hongguo.VIDEO_REFERER;
-        response = await axios({
-          method: 'GET', url: playInfo.url, responseType: 'stream',
-          headers, timeout: 60000, cancelToken: source.token,
-        });
-      } else {
-        throw err;
+  let received = 0;
+  let stalled = false;
+  let idleTimer = null;
+  const clearIdle = () => { if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; } };
+  const armIdle = () => {
+    clearIdle();
+    idleTimer = setTimeout(() => {
+      stalled = true;
+      console.warn(`[Hongguo] 下载卡死（${DOWNLOAD_IDLE_TIMEOUT_MS / 1000} 秒无数据），中断后自动重试:`, finalPath);
+      if (task.cancelSource) {
+        try { task.cancelSource.cancel('下载卡死'); } catch (_) {}
       }
-    }
+      try { response.data.destroy(new Error('下载卡死')); } catch (_) {}
+      try { writer.destroy(); } catch (_) {}
+    }, DOWNLOAD_IDLE_TIMEOUT_MS);
+  };
 
-    const totalLength = parseInt(response.headers['content-length'], 10) || 0;
-    task.totalBytes = totalLength;
+  armIdle();
+  response.data.on('data', (chunk) => {
+    received += chunk.length;
+    task.receivedBytes = received;
+    const progress = totalLength ? Math.floor((received / totalLength) * 100) : 0;
+    task.progress = progress;
+    sendToRenderer('download-progress', { id, progress, receivedBytes: received, totalBytes: totalLength });
+    armIdle();
+  });
 
-    const writer = fs.createWriteStream(tmpPath);
-    task.writer = writer;
+  response.data.pipe(writer);
 
-    let received = 0;
-    response.data.on('data', (chunk) => {
-      received += chunk.length;
-      task.receivedBytes = received;
-      const progress = totalLength ? Math.floor((received / totalLength) * 100) : 0;
-      task.progress = progress;
-      sendToRenderer('download-progress', { id, progress, receivedBytes: received, totalBytes: totalLength });
-    });
-
-    response.data.pipe(writer);
+  try {
     await new Promise((resolve, reject) => {
       writer.on('finish', resolve);
       writer.on('error', reject);
+      writer.on('close', () => { if (stalled) reject(new Error('下载卡死')); });
+      response.data.on('error', reject);
     });
-
+  } finally {
+    clearIdle();
     delete task.cancelSource;
     delete task.writer;
-
-    if (task.cancelled) {
-      if (fs.existsSync(tmpPath)) try { fs.unlinkSync(tmpPath); } catch (_) {}
-      task.status = 'stopped';
-      task.endTime = Date.now();
-      saveDownloadTasks();
-      sendToRenderer('download-stopped', { id });
-      return;
-    }
-
-    // 4. CENC-AES-CTR 解密
-    if (playInfo.spadeA) {
-      console.log('[Hongguo] 正在派生 AES Key 并解密 MP4...');
-      const key = hongguo.deriveKey(playInfo.spadeA);
-      if (!key) {
-        throw new Error('Key 派生失败');
-      }
-      hongguo.decryptMp4File(tmpPath, finalPath, key);
-      try { fs.unlinkSync(tmpPath); } catch (_) {}
-    } else {
-      fs.renameSync(tmpPath, finalPath);
-    }
-
-    task.status = 'completed';
-    task.progress = 100;
-    task.endTime = Date.now();
-    saveDownloadTasks();
-
-    console.log('[Hongguo] 下载完成:', finalPath);
-    sendToRenderer('download-completed', { id, path: finalPath });
-  } catch (error) {
-    console.error('[Hongguo] 下载失败:', error.message);
-    delete task.cancelSource;
-    delete task.writer;
-    task.status = 'failed';
-    task.error = error.message;
-    saveDownloadTasks();
-    sendToRenderer('download-failed', { id, error: error.message });
+    try { response.data.destroy(); } catch (_) {}
   }
+
+  if (task.cancelled) {
+    throw new Error('任务已取消');
+  }
+  if (stalled) {
+    throw new Error(`下载卡死（${DOWNLOAD_IDLE_TIMEOUT_MS / 1000} 秒无数据）`);
+  }
+  // 服务端声明了长度却没下完，说明连接被中途掐断
+  if (totalLength > 0 && received < totalLength) {
+    throw new Error(`下载不完整（${received}/${totalLength} 字节）`);
+  }
+  if (received < 1024) {
+    throw new Error('下载内容异常（文件过小）');
+  }
+
+  // 4. CENC-AES-CTR 解密
+  if (playInfo.spadeA) {
+    console.log('[Hongguo] 正在派生 AES Key 并解密 MP4...');
+    const key = hongguo.deriveKey(playInfo.spadeA);
+    if (!key) {
+      throw new Error('Key 派生失败');
+    }
+    hongguo.decryptMp4File(tmpPath, finalPath, key);
+    try { fs.unlinkSync(tmpPath); } catch (_) {}
+  } else {
+    fs.renameSync(tmpPath, finalPath);
+  }
+
+  task.status = 'completed';
+  task.progress = 100;
+  task.error = '';
+  task.endTime = Date.now();
+  saveDownloadTasks();
+
+  console.log('[Hongguo] 下载完成:', finalPath);
+  sendToRenderer('download-completed', { id, path: finalPath });
 }
 
 // 向渲染进程发送事件
@@ -1723,8 +1815,22 @@ function registerLocalProtocol() {
   });
 }
 
-/** 下载整集到内存并解密（官网兜底时直链为明文 MP4，跳过解密） */
+/** 下载整集到内存并解密（官网兜底时直链为明文 MP4，跳过解密）；卡死或失败会自动重试 */
 async function fetchDecryptedEpisode(vid, onProgress, seriesId) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      return await fetchDecryptedEpisodeOnce(vid, onProgress, seriesId);
+    } catch (error) {
+      lastError = error;
+      console.warn(`[Online] 第 ${attempt}/2 次缓存失败: ${(error && error.message) || error}`);
+      if (attempt < 2) await delay(1200 * attempt);
+    }
+  }
+  throw lastError;
+}
+
+async function fetchDecryptedEpisodeOnce(vid, onProgress, seriesId) {
   const playInfo = await hongguo.fetchPlayUrlSingle(vid, seriesId);
   if (!playInfo || !playInfo.url) throw new Error('未获取到有效播放地址');
 
@@ -1748,15 +1854,36 @@ async function fetchDecryptedEpisode(vid, onProgress, seriesId) {
   const total = parseInt(response.headers['content-length'], 10) || 0;
   const chunks = [];
   let received = 0;
-  await new Promise((resolve, reject) => {
-    response.data.on('data', (c) => {
-      chunks.push(c);
-      received += c.length;
-      if (onProgress) onProgress(received, total);
+  let stalled = false;
+  let idleTimer = null;
+  const clearIdle = () => { if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; } };
+  const armIdle = () => {
+    clearIdle();
+    idleTimer = setTimeout(() => {
+      stalled = true;
+      console.warn(`[Online] 缓存卡死（${DOWNLOAD_IDLE_TIMEOUT_MS / 1000} 秒无数据），中断后重试`);
+      try { response.data.destroy(new Error('缓存卡死')); } catch (_) {}
+    }, DOWNLOAD_IDLE_TIMEOUT_MS);
+  };
+
+  armIdle();
+  try {
+    await new Promise((resolve, reject) => {
+      response.data.on('data', (c) => {
+        chunks.push(c);
+        received += c.length;
+        if (onProgress) onProgress(received, total);
+        armIdle();
+      });
+      response.data.on('end', () => { stalled ? reject(new Error('缓存卡死')) : resolve(); });
+      response.data.on('error', reject);
     });
-    response.data.on('end', resolve);
-    response.data.on('error', reject);
-  });
+  } finally {
+    clearIdle();
+  }
+
+  if (stalled) throw new Error(`缓存卡死（${DOWNLOAD_IDLE_TIMEOUT_MS / 1000} 秒无数据）`);
+  if (total > 0 && received < total) throw new Error(`缓存不完整（${received}/${total} 字节）`);
 
   let buf = Buffer.concat(chunks);
   if (playInfo.spadeA) {
