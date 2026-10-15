@@ -811,9 +811,20 @@ function decryptMp4Buffer(data, key) {
  * 解密 MP4 文件并保存
  */
 function decryptMp4File(srcPath, dstPath, key) {
-  const data = fs.readFileSync(srcPath);
+  let data;
+  try {
+    data = fs.readFileSync(srcPath);
+  } catch (err) {
+    if (err && !err.filePath) err.filePath = srcPath;
+    throw err;
+  }
   const finalBuf = decryptMp4Buffer(data, key);
-  fs.writeFileSync(dstPath, finalBuf);
+  try {
+    fs.writeFileSync(dstPath, finalBuf);
+  } catch (err) {
+    if (err && !err.filePath) err.filePath = dstPath;
+    throw err;
+  }
 }
 
 module.exports = {

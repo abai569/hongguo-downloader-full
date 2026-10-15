@@ -189,6 +189,24 @@ function SettingsPage() {
         </div>
 
         <div className="settings-group">
+          <label className="settings-label">窗口与后台</label>
+          <label className="proxy-switch-row">
+            <input
+              type="checkbox"
+              checked={settings.close_to_tray !== false}
+              onChange={(e) => update('close_to_tray', e.target.checked)}
+            />
+            <span className="proxy-switch-text">
+              关闭窗口时隐藏到托盘（默认开启）
+              <em>下载会继续在后台进行；要真正退出，请右键任务栏右下角托盘图标选「退出」</em>
+            </span>
+          </label>
+          <p className="settings-hint">
+            托盘图标在任务栏右下角通知区域，若没看到请点「显示隐藏的图标」。保存后立即生效。
+          </p>
+        </div>
+
+        <div className="settings-group">
           <label className="settings-label">网络代理</label>
           <div className="proxy-status-row">
             <span className={`proxy-dot ${proxyInfo.on ? 'proxy-dot-on' : 'proxy-dot-off'}`} />

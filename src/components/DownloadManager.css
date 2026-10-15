@@ -333,6 +333,7 @@
 .dm-task-meta {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 10px;
   margin-top: 4px;
   font-size: 12px;
@@ -353,7 +354,14 @@
 .status-stopped { background: var(--bg-inset); color: var(--text-tertiary); }
 
 .dm-size { font-variant-numeric: tabular-nums; }
-.dm-error { color: var(--danger); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dm-error {
+  color: var(--danger);
+  white-space: normal;
+  word-break: break-all;
+  line-height: 1.45;
+  /* 失败原因含完整路径，单独占一行完整显示，不再被省略号截断 */
+  flex: 1 0 100%;
+}
 
 .dm-progress {
   display: flex;

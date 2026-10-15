@@ -8,7 +8,7 @@
  *   4. 下载管理：进度推送、暂停/取消、重试、删除、打开所在文件夹
  *   5. 设置：下载目录、命名规则、并发数（JSON 文件持久化）
  */
-const { app, BrowserWindow, ipcMain, dialog, shell, session, protocol } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, session, protocol, Tray, Menu, nativeImage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const fsp = require('fs/promises');
@@ -102,6 +102,8 @@ function getDefaultSettings() {
     // 文件命名模板：可用变量 剧名(series_title) 集数(vid_index) 标题(ep_title)
     name_format: '剧名 集数',
     max_concurrent: 3,
+    // 关闭主窗口时隐藏到托盘（默认开启）：下载继续在后台跑，托盘菜单可真正退出
+    close_to_tray: true,
     // 看完一集后自动删除本地文件（边看边清，避免占用磁盘）
     auto_delete_watched: false,
     // 兼容模式：本机无法解码 HEVC 时自动转码为 H.264（解决「黑屏有声」）
@@ -484,6 +486,100 @@ function delay(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/**
+ * 把文件系统错误翻译成能直接照做的提示。
+ * Windows 上的 EPERM / EACCES 基本只有三种来源：
+ * 目标被别的程序占用、同名位置是个文件夹、文件是只读。
+ */
+function describeFileError(error, filePath) {
+  const code = (error && error.code) || '';
+  const raw = (error && error.message) || String(error || '未知错误');
+  let info = null;
+  try { info = fs.statSync(filePath); } catch (_) {}
+
+  if (info && info.isDirectory()) {
+    return `目标位置被同名文件夹占用，请删除或重命名该文件夹后重试（${filePath}）`;
+  }
+  if (code === 'EPERM' || code === 'EACCES' || code === 'EBUSY') {
+    return info
+      ? `文件被其他程序占用或为只读，请关闭占用它的程序（播放器／杀毒软件）后重试（${filePath}）`
+      : `没有写入权限，请检查目录权限或杀毒软件拦截（${filePath}）`;
+  }
+  if (code === 'ENOSPC') return `磁盘空间不足（${filePath}）`;
+  if (code === 'ENOENT') return `目录不存在或路径过长（${filePath}）`;
+  return `${raw}（${filePath}）`;
+}
+
+/**
+ * 让目标位置可写：同名文件夹无法自愈（直接给出可读错误）；
+ * 只读文件或上次中断残留的文件则尽力删掉。
+ */
+function prepareWritablePath(filePath, label) {
+  let info = null;
+  try { info = fs.statSync(filePath); } catch (_) { return; }
+  if (info.isDirectory()) {
+    throw new Error(`${label}位置被同名文件夹占用，请删除或重命名该文件夹后重试（${filePath}）`);
+  }
+  try {
+    fs.unlinkSync(filePath);
+    return;
+  } catch (err) {
+    // Windows 上"只读"属性会让删除直接失败，先去掉只读再试一次
+    try {
+      fs.chmodSync(filePath, 0o666);
+      fs.unlinkSync(filePath);
+      return;
+    } catch (_) {}
+    throw new Error(describeFileError(err, filePath));
+  }
+}
+
+/**
+ * 残留的 .enc.tmp 若被占用会锁死后续每一次重试（删不掉→写不进）。
+ * 能清就清，清不掉就换一个唯一名字继续，不让这一集卡住。
+ */
+function resolveUsableTmpPath(basePath) {
+  try {
+    prepareWritablePath(basePath, '临时文件');
+    return basePath;
+  } catch (err) {
+    const alt = `${basePath}.${Date.now().toString(36)}`;
+    console.warn(`[Hongguo] ${err.message}；本次改用新临时文件：${alt}`);
+    return alt;
+  }
+}
+
+/** 启动时清理下载目录里残留的 *.enc.tmp（上次异常退出留下的半成品） */
+function cleanupStaleTempFiles() {
+  let root = '';
+  try {
+    const settings = getCurrentSettings();
+    root = (settings.root && String(settings.root).trim()) ? String(settings.root).trim() : app.getPath('downloads');
+  } catch (_) {
+    return 0;
+  }
+  const base = path.join(root, '红果短剧');
+  if (!fs.existsSync(base)) return 0;
+
+  let removed = 0;
+  const walk = (dir, depth) => {
+    if (depth > 4) return;
+    let entries = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (_) { return; }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full, depth + 1);
+      } else if (entry.name.endsWith('.enc.tmp')) {
+        try { fs.unlinkSync(full); removed++; } catch (_) {}
+      }
+    }
+  };
+  walk(base, 0);
+  if (removed > 0) console.log(`[Hongguo] 启动清理：删除 ${removed} 个残留临时文件`);
+  return removed;
+}
+
 async function executeHongguoDownload(task) {
   let lastError = null;
 
@@ -503,7 +599,9 @@ async function executeHongguoDownload(task) {
         markTaskStopped(task);
         return;
       }
-      const message = (error && error.message) || String(error);
+      const message = error && error.filePath
+        ? describeFileError(error, error.filePath)
+        : ((error && error.message) || String(error));
       const info = task.hongguoInfo || {};
       console.warn(`[Hongguo] 《${info.series_title || ''}》第${info.vid_index || ''}集 第 ${attempt}/${DOWNLOAD_MAX_ATTEMPTS} 次失败: ${message}`);
       if (attempt < DOWNLOAD_MAX_ATTEMPTS) {
@@ -568,22 +666,28 @@ async function downloadHongguoEpisode(task, attempt) {
   const finalPath = task.savePath || path.join(downloadDir, filename);
   task.savePath = finalPath;
 
-  // 目标已存在且大小合格，跳过重下
-  if (fs.existsSync(finalPath) && fs.statSync(finalPath).size > 1024 * 100) {
-    console.log('[Hongguo] 文件已存在，直接完成:', finalPath);
-    task.status = 'completed';
-    task.progress = 100;
-    task.error = '';
-    task.endTime = Date.now();
-    saveDownloadTasks();
-    sendToRenderer('download-completed', { id, path: finalPath });
-    return;
+  // 目标已存在：够大就跳过；同名文件夹或上次中断的半成品先处理掉
+  if (fs.existsSync(finalPath)) {
+    let existing = null;
+    try { existing = fs.statSync(finalPath); } catch (_) {}
+    if (existing && existing.isDirectory()) {
+      throw new Error(`目标位置被同名文件夹占用，请删除或重命名该文件夹后重试（${finalPath}）`);
+    }
+    if (existing && existing.size > 1024 * 100) {
+      console.log('[Hongguo] 文件已存在，直接完成:', finalPath);
+      task.status = 'completed';
+      task.progress = 100;
+      task.error = '';
+      task.endTime = Date.now();
+      saveDownloadTasks();
+      sendToRenderer('download-completed', { id, path: finalPath });
+      return;
+    }
+    // 太小说明是上次中断留下的半成品（也可能带只读属性），清掉重下
+    prepareWritablePath(finalPath, '目标文件');
   }
 
-  const tmpPath = finalPath + '.enc.tmp';
-  if (fs.existsSync(tmpPath)) {
-    try { fs.unlinkSync(tmpPath); } catch (_) {}
-  }
+  const tmpPath = resolveUsableTmpPath(finalPath + '.enc.tmp');
 
   // 3. HTTP 流式下载（带"长时间无数据"看门狗）
   const CancelToken = axios.CancelToken;
@@ -611,6 +715,8 @@ async function downloadHongguoEpisode(task, attempt) {
   task.totalBytes = totalLength;
 
   const writer = fs.createWriteStream(tmpPath);
+  // 给写句柄的错误标上路径，失败时才能说清"哪个文件被占用"
+  writer.on('error', (err) => { if (err && !err.filePath) err.filePath = tmpPath; });
   task.writer = writer;
 
   let received = 0;
@@ -642,6 +748,7 @@ async function downloadHongguoEpisode(task, attempt) {
 
   response.data.pipe(writer);
 
+  let failed = false;
   try {
     await new Promise((resolve, reject) => {
       writer.on('finish', resolve);
@@ -649,11 +756,20 @@ async function downloadHongguoEpisode(task, attempt) {
       writer.on('close', () => { if (stalled) reject(new Error('下载卡死')); });
       response.data.on('error', reject);
     });
+  } catch (err) {
+    failed = true;
+    throw err;
   } finally {
     clearIdle();
     delete task.cancelSource;
     delete task.writer;
     try { response.data.destroy(); } catch (_) {}
+    // 失败时也必须关掉写句柄：否则残留的 .enc.tmp 会被自己锁住，
+    // 之后每一次重试都会 EPERM，连手动删除都删不掉。
+    try { writer.destroy(); } catch (_) {}
+    if (failed) {
+      try { fs.unlinkSync(tmpPath); } catch (_) {}
+    }
   }
 
   if (task.cancelled) {
@@ -677,10 +793,20 @@ async function downloadHongguoEpisode(task, attempt) {
     if (!key) {
       throw new Error('Key 派生失败');
     }
-    hongguo.decryptMp4File(tmpPath, finalPath, key);
+    try {
+      hongguo.decryptMp4File(tmpPath, finalPath, key);
+    } catch (err) {
+      if (err && !err.filePath) err.filePath = finalPath;
+      throw err;
+    }
     try { fs.unlinkSync(tmpPath); } catch (_) {}
   } else {
-    fs.renameSync(tmpPath, finalPath);
+    try {
+      fs.renameSync(tmpPath, finalPath);
+    } catch (err) {
+      if (err && !err.filePath) err.filePath = finalPath;
+      throw err;
+    }
   }
 
   task.status = 'completed';
@@ -2863,6 +2989,70 @@ ipcMain.handle('open-external-url', async (event, url) => {
 });
 
 // ===== 窗口创建 =====
+// ===== 托盘 / 关闭行为 =====
+let tray = null;
+let isQuitting = false;
+let trayTipShown = false;
+
+function showMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow();
+    return;
+  }
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+/** 关闭窗口是否隐藏到托盘（设置里可关；读不到设置时按开启处理） */
+function closeToTrayEnabled() {
+  try {
+    return getCurrentSettings().close_to_tray !== false;
+  } catch (_) {
+    return true;
+  }
+}
+
+async function createTray() {
+  if (tray) return;
+  let icon = nativeImage.createEmpty();
+  try {
+    // 直接用 exe 自身的图标，无需额外打包图片资源
+    icon = await app.getFileIcon(process.execPath, { size: 'small' });
+  } catch (_) {}
+  try {
+    tray = new Tray(icon);
+  } catch (err) {
+    console.warn('[Tray] 托盘创建失败:', err.message);
+    tray = null;
+    return;
+  }
+  tray.setToolTip(APP_TITLE);
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: '显示主界面', click: () => showMainWindow() },
+    { label: '隐藏到托盘', click: () => { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.hide(); } },
+    { type: 'separator' },
+    { label: '退出', click: () => { isQuitting = true; app.quit(); } },
+  ]));
+  tray.on('click', () => showMainWindow());
+  tray.on('double-click', () => showMainWindow());
+}
+
+function minimizeToTray() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.hide();
+  if (!trayTipShown && tray) {
+    trayTipShown = true;
+    // 只提示一次，避免用户以为程序被关掉了（其实下载还在继续）
+    try {
+      tray.displayBalloon({
+        title: '仍在后台运行',
+        content: '下载会继续进行。右键任务栏右下角的托盘图标可选择「退出」。',
+      });
+    } catch (_) {}
+  }
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1100,
@@ -2890,6 +3080,13 @@ function createWindow() {
     mainWindow.loadFile(path.join(__dirname, 'dist-react', 'index.html'));
   }
 
+  // 关闭窗口默认隐藏到托盘（下载继续跑）；托盘菜单的「退出」才会真正结束进程
+  mainWindow.on('close', (event) => {
+    if (isQuitting || !closeToTrayEnabled()) return;
+    event.preventDefault();
+    minimizeToTray();
+  });
+
   mainWindow.on('closed', () => {
     mainWindow = null;
   });
@@ -2909,6 +3106,9 @@ app.whenReady().then(async () => {
   registerLocalProtocol();
   const settings = getCurrentSettings();
 
+  // 上次异常退出可能留下被残留句柄占用、删不掉的 *.enc.tmp，先清一遍
+  try { cleanupStaleTempFiles(); } catch (e) { console.warn('[Cleanup] 清理残留临时文件失败:', e.message); }
+
   // 代理必须在创建窗口、发起任何请求之前生效
   await applyProxySettings(settings);
 
@@ -2920,12 +3120,19 @@ app.whenReady().then(async () => {
   }
 
   createWindow();
+  await createTray();
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    if (BrowserWindow.getAllWindows().length === 0) showMainWindow();
   });
 });
 
+app.on('before-quit', () => {
+  // 真正退出（托盘菜单 / 系统关机 / 安装程序）时放行窗口关闭
+  isQuitting = true;
+});
+
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit();
+  // 关闭窗口通常只是隐藏到托盘，只有显式退出才结束进程
+  if (isQuitting && process.platform !== 'darwin') app.quit();
 });

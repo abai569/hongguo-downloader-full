@@ -554,7 +554,7 @@ function DownloadManager({ onNavigate }) {
                     {task.status === 'downloading' && task.totalBytes > 0 && (
                       <span className="dm-size">{fmtBytes(task.receivedBytes)} / {fmtBytes(task.totalBytes)}</span>
                     )}
-                    {task.error && <span className="dm-error">{task.error}</span>}
+                    {task.error && <span className="dm-error" title={task.error}>{task.error}</span>}
                   </div>
                   {(task.status === 'downloading' || task.status === 'pending') && (
                     <div className="dm-progress">
