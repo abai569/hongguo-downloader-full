@@ -3013,13 +3013,25 @@ function closeToTrayEnabled() {
   }
 }
 
+/** 托盘图标：优先用专门生成的透明底 tray.png（深色底缩到 16px 会糊成一团黑块），取不到再退回 exe 图标 */
+async function loadTrayIcon() {
+  const trayPath = path.join(__dirname, 'build', 'tray.png');
+  try {
+    if (fs.existsSync(trayPath)) {
+      const image = nativeImage.createFromPath(trayPath);
+      if (!image.isEmpty()) return image;
+    }
+  } catch (_) {}
+  try {
+    return await app.getFileIcon(process.execPath, { size: 'small' });
+  } catch (_) {
+    return nativeImage.createEmpty();
+  }
+}
+
 async function createTray() {
   if (tray) return;
-  let icon = nativeImage.createEmpty();
-  try {
-    // 直接用 exe 自身的图标，无需额外打包图片资源
-    icon = await app.getFileIcon(process.execPath, { size: 'small' });
-  } catch (_) {}
+  const icon = await loadTrayIcon();
   try {
     tray = new Tray(icon);
   } catch (err) {
@@ -3060,6 +3072,7 @@ function createWindow() {
     minWidth: 900,
     minHeight: 620,
     title: APP_TITLE,
+    icon: path.join(__dirname, 'build', 'icon.png'),
     autoHideMenuBar: true,
     backgroundColor: '#f5f6fa',
     webPreferences: {
@@ -3083,6 +3096,8 @@ function createWindow() {
   // 关闭窗口默认隐藏到托盘（下载继续跑）；托盘菜单的「退出」才会真正结束进程
   mainWindow.on('close', (event) => {
     if (isQuitting || !closeToTrayEnabled()) return;
+    // 托盘不可用时按原来的行为直接退出，绝不能不隐藏又不退出（否则用户找不回程序）
+    if (!tray) return;
     event.preventDefault();
     minimizeToTray();
   });
