@@ -95,6 +95,12 @@
       "shortcutName": "红果短剧下载器",
       "artifactName": "${productName}-Setup-${version}.${ext}",
       "include": "build/installer.nsh"
-    }
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "releaseType": "release"
+      }
+    ]
   }
 }
