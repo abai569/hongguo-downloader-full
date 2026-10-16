@@ -3130,7 +3130,9 @@ function createWindow() {
         }
         // choice === 2: 退出程序
       }
+      // 直接退出，不依赖 window-all-closed
       isQuitting = true;
+      app.quit();
       return;
     }
     // 托盘不可用时按原来的行为直接退出，绝不能不隐藏又不退出（否则用户找不回程序）
