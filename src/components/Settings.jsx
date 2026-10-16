@@ -198,7 +198,7 @@ function SettingsPage() {
             />
             <span className="proxy-switch-text">
               关闭窗口时隐藏到托盘（默认开启）
-              <em>下载会继续在后台进行；要真正退出，请右键任务栏右下角托盘图标选「退出」</em>
+              <em>开启：点 X 隐藏到托盘，下载继续；关闭：点 X 退出程序（有下载任务时会弹确认框）</em>
             </span>
           </label>
           <p className="settings-hint">

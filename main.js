@@ -20,6 +20,13 @@ const APP_VERSION = app.getVersion() || '1.0.0';
 
 const APP_TITLE = '红果短剧下载器';
 
+// 单实例：避免多个进程同时写 data.json 导致下载列表错乱或临时文件损坏
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  app.on('second-instance', () => showMainWindow());
+}
+
 let mainWindow = null;
 
 // ===== 视频解码兼容性 =====
@@ -3093,9 +3100,39 @@ function createWindow() {
     mainWindow.loadFile(path.join(__dirname, 'dist-react', 'index.html'));
   }
 
-  // 关闭窗口默认隐藏到托盘（下载继续跑）；托盘菜单的「退出」才会真正结束进程
+  // 关闭窗口：开关打开时隐藏到托盘，关闭时点 X 即退出程序
   mainWindow.on('close', (event) => {
-    if (isQuitting || !closeToTrayEnabled()) return;
+    if (isQuitting) return;
+    if (!closeToTrayEnabled()) {
+      // 开关关掉 = 点 X 即退出；有任务在跑时弹确认框防误杀
+      const busy = activeDownloads > 0 || downloadQueue.length > 0;
+      if (busy) {
+        const choice = dialog.showMessageBoxSync(mainWindow, {
+          type: 'warning',
+          buttons: ['后台继续下载', '取消', '退出程序'],
+          defaultId: 0,
+          cancelId: 1,
+          message: '仍有下载任务在进行',
+          detail: '退出将中断当前下载，可稍后重试续传。',
+        });
+        if (choice === 0) {
+          // 隐藏到托盘继续下载
+          if (tray) {
+            event.preventDefault();
+            minimizeToTray();
+          }
+          return;
+        }
+        if (choice === 1) {
+          // 取消，什么都不做
+          event.preventDefault();
+          return;
+        }
+        // choice === 2: 退出程序
+      }
+      isQuitting = true;
+      return;
+    }
     // 托盘不可用时按原来的行为直接退出，绝不能不隐藏又不退出（否则用户找不回程序）
     if (!tray) return;
     event.preventDefault();
