@@ -24,12 +24,18 @@
   justify-content: space-between;
   gap: 12px;
   margin-top: 12px;
-  flex-wrap: wrap;
+  /* 必须一行：提示文字超长就省略，不允许换行把按钮挤到第二行 */
+  flex-wrap: nowrap;
 }
 
 .dy-hint {
   font-size: 12px;
   color: var(--text-secondary, #8b8b95);
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .dy-actions-right {

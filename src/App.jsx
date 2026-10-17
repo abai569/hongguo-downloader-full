@@ -9,9 +9,9 @@ import Browse from './components/Browse';
 
 const MENU = [
   { id: 'browse', label: '浏览', icon: Sparkles },
+  { id: 'player', label: '播放', icon: Play },
   { id: 'download', label: '红果下载', icon: Film },
   { id: 'douyin', label: '抖音下载', icon: Music },
-  { id: 'player', label: '播放', icon: Play },
   { id: 'manager', label: '下载管理', icon: Download },
   { id: 'settings', label: '设置', icon: Settings },
 ];
@@ -89,7 +89,7 @@ export default function App() {
         </div>
 
         <div className="sidebar-footer">
-          <div className="footer-note">AES-128 CENC 原生解密 · 无水印</div>
+          <div className="footer-note">QQ交流群：1109483648</div>
         </div>
       </div>
 
