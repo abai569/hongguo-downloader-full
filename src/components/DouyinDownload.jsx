@@ -6,6 +6,7 @@ const STAGE_TEXT = {
   opening: '正在识别链接…',
   window: '正在打开抖音页面…',
   loaded: (p) => (p.found > 0 ? `已发现 ${p.found} 个作品` : '页面已加载，等待接口返回…'),
+  retry: (p) => `该入口没有数据，改用备用入口（${p.attempt}/${p.total}）…`,
   page: (p) => `已读取 ${p.pages || 0} 页，发现 ${p.found || 0} 个作品`,
   scroll: (p) => `已发现 ${p.found || 0} 个作品，正在加载更多…`,
   detail: (p) => `正在补全直链 ${p.found || 0} 个…`,
@@ -151,19 +152,28 @@ function DouyinDownload({ onNavigate }) {
         />
         <div className="dy-input-actions">
           <span className="dy-hint">解析需要后台渲染页面，通常 3–8 秒；同一作者/合集再次解析会更快</span>
-          <button className="btn btn-primary" onClick={handleResolve} disabled={loading}>
-            {loading ? (
-              <>
-                <RefreshCw size={16} className="spin" />
-                <span>解析中…</span>
-              </>
-            ) : (
-              <>
-                <Music size={16} />
-                <span>解析合集</span>
-              </>
-            )}
-          </button>
+          <div className="dy-actions-right">
+            <button
+              className="btn btn-outline btn-sm"
+              onClick={() => window.electronAPI.openDouyinLog && window.electronAPI.openDouyinLog()}
+              title="解析卡住或失败时，把日志文件发给开发者"
+            >
+              查看解析日志
+            </button>
+            <button className="btn btn-primary" onClick={handleResolve} disabled={loading}>
+              {loading ? (
+                <>
+                  <RefreshCw size={16} className="spin" />
+                  <span>解析中…</span>
+                </>
+              ) : (
+                <>
+                  <Music size={16} />
+                  <span>解析合集</span>
+                </>
+              )}
+            </button>
+          </div>
         </div>
         {loading && progressText(progress) && (
           <div className="dy-progress-hint">{progressText(progress)}</div>

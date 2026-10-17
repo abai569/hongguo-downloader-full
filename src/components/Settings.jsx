@@ -48,9 +48,15 @@ function SettingsPage() {
   const [proxyDraft, setProxyDraft] = useState(null);
   const [testResult, setTestResult] = useState(null);
   const [testing, setTesting] = useState(false);
+  const [logPath, setLogPath] = useState('');
 
   useEffect(() => {
     window.electronAPI.getSettings().then(setSettings);
+    if (window.electronAPI.douyinLogPath) {
+      window.electronAPI.douyinLogPath()
+        .then((res) => { if (res && res.success) setLogPath(res.path); })
+        .catch(() => {});
+    }
   }, []);
 
   const update = (key, value) => {
@@ -235,6 +241,7 @@ function SettingsPage() {
               打开解析日志
             </button>
           </div>
+          {logPath && <p className="settings-hint">日志文件：<code>{logPath}</code></p>}
         </div>
 
         <div className="settings-group">

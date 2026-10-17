@@ -14,6 +14,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   douyinResolveCollection: (input) => ipcRenderer.invoke('douyin-resolve-collection', input),
   douyinDownloadCollection: (payload) => ipcRenderer.invoke('douyin-download-collection', payload),
   openDouyinLog: () => ipcRenderer.invoke('open-douyin-log'),
+  douyinLogPath: () => ipcRenderer.invoke('douyin-log-path'),
   onDouyinParseProgress: (cb) => {
     const listener = (_e, data) => cb(data);
     ipcRenderer.on('douyin-parse-progress', listener);

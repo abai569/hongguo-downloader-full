@@ -2716,16 +2716,31 @@ ipcMain.handle('hongguo-download-batch', async (event, payload) => {
 ipcMain.handle('douyin-resolve-collection', async (event, input) => {
   try {
     const settings = getCurrentSettings();
-    const data = await douyin.resolveCollection(input, {
-      showWindow: settings.douyin_parse_window === true,
-      onProgress: (progress) => sendToRenderer('douyin-parse-progress', progress),
+    // 整体兜底超时：解析链内部各段都有超时，这里再兜一层，避免界面无限"解析中"
+    const timeout = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('解析超时（超过 45 秒），请查看解析日志')), 45000);
     });
+    const data = await Promise.race([
+      douyin.resolveCollection(input, {
+        showWindow: settings.douyin_parse_window === true,
+        onProgress: (progress) => sendToRenderer('douyin-parse-progress', progress),
+      }),
+      timeout,
+    ]);
     douyin.log('[ipc] 解析成功：作品数 ' + data.items.length);
     return { success: true, data };
   } catch (error) {
     douyin.log('[ipc] 解析失败：' + error.message);
     if (error && error.stack) douyin.log('[ipc] stack: ' + String(error.stack).split('\n').slice(0, 4).join(' | '));
     console.error('[Douyin] 合集解析失败:', error.message);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('douyin-log-path', async () => {
+  try {
+    return { success: true, path: douyin.logPath() };
+  } catch (error) {
     return { success: false, error: error.message };
   }
 });

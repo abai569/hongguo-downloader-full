@@ -983,9 +983,11 @@ async function resolveCollection(input, options = {}) {
     const urls = Array.isArray(pageUrls) ? pageUrls : [pageUrls];
     let lastError = null;
 
-    for (const pageUrl of urls) {
+    for (let i = 0; i < urls.length; i++) {
+      const pageUrl = urls[i];
       try {
-        log('[result] 尝试入口 ' + urlPath(pageUrl));
+        log('[result] 尝试入口 ' + (i + 1) + '/' + urls.length + ' ' + urlPath(pageUrl));
+        if (i > 0) onProgress({ stage: 'retry', attempt: i + 1, total: urls.length, pages: 0, found: 0 });
         const captured = await capturePage(pageUrl, {
           showWindow: options.showWindow,
           paged,

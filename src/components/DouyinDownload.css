@@ -32,6 +32,13 @@
   color: var(--text-secondary, #8b8b95);
 }
 
+.dy-actions-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
 .dy-progress-hint {
   margin-top: 10px;
   font-size: 12px;
