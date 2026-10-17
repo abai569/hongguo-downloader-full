@@ -7,6 +7,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // 复制文本到系统剪贴板（页脚 QQ 群号等）
   copyText: (text) => ipcRenderer.invoke('copy-text', text),
 
+  // 局域网共享（电视 / 手机播放已下载视频）
+  lanShareStart: () => ipcRenderer.invoke('lan-share-start'),
+  lanShareStop: () => ipcRenderer.invoke('lan-share-stop'),
+  lanShareStatus: () => ipcRenderer.invoke('lan-share-status'),
+
 
   // 红果解析与下载
   hongguoResolve: (input) => ipcRenderer.invoke('hongguo-resolve', input),

@@ -13,6 +13,8 @@ const { app, BrowserWindow, ipcMain, dialog, shell, session, protocol, Tray, Men
 const path = require('path');
 const fs = require('fs');
 const fsp = require('fs/promises');
+const http = require('http');
+const os = require('os');
 const axios = require('axios');
 
 const hongguo = require('./src/native/hongguo');
@@ -123,6 +125,9 @@ function getDefaultSettings() {
     douyin_quality: 'best',
     // 抖音作品排序：smart=有集数按集数（其余按发布时间正序）·episode·time-asc·time-desc·original
     douyin_sort: 'smart',
+    // 局域网共享（电视/手机播放已下载视频）：开启后启动内置 HTTP 服务
+    lan_share_enabled: false,
+    lan_share_port: 8899,
     // ===== 网络代理 =====
     // proxy_enabled: 是否启用代理（关闭时忽略系统代理，直连）
     // proxy_mode:    system=跟随系统/环境变量 · custom=手动指定 · direct=强制直连
@@ -1387,14 +1392,41 @@ ipcMain.handle('search-window-show', async (event, visible) => {
   return { success: true };
 });
 
-// 已登记的短剧档案（不含被用户移除的）
-ipcMain.handle('get-series-list', async () => [...visibleSeries(), ...douyinCollectionList()]);
+/**
+ * 该剧目录下是否还有真实文件。
+ * 只看登记表会把「任务删了但 series 记录还在」的空壳一直留在合并下拉框里，
+ * 所以这里必须同时看任务记录与磁盘目录（collectSeriesEpisodeFiles 两者都扫）。
+ */
+function seriesHasLocalFiles(seriesId, seriesTitle) {
+  try {
+    const scanned = collectSeriesEpisodeFiles(seriesId, seriesTitle);
+    if (scanned && scanned.ordered && scanned.ordered.length > 0) return true;
+  } catch (_) {}
+  return false;
+}
+
+// 已登记的短剧档案（不含被用户移除的，且磁盘上必须真的还有文件）
+ipcMain.handle('get-series-list', async () => {
+  const hongguo = visibleSeries().filter((s) => seriesHasLocalFiles(s.series_id, s.series_title));
+  const douyin = douyinCollectionList();
+  return [...hongguo, ...douyin];
+});
 
 /** 已下载的抖音合集，伪造成 series 条目供「一键合并」下拉框复用 */
 function douyinCollectionList() {
   const groups = new Map();
+  const usable = (task) => {
+    // 任务记录还在但文件已被删的，不算
+    if (!task.savePath) return false;
+    try {
+      return fs.existsSync(task.savePath) && fs.statSync(task.savePath).size > 1024 * 100;
+    } catch (_) {
+      return false;
+    }
+  };
   for (const task of downloadTasks) {
     if (!task.douyinInfo) continue;
+    if (!usable(task)) continue;
     const mixId = String(task.douyinInfo.mix_id || '');
     if (!mixId) continue;
     const key = 'douyin:' + mixId;
@@ -1410,6 +1442,37 @@ function douyinCollectionList() {
       });
     }
   }
+  // 2) 磁盘扫描兜底：任务记录被删掉、但文件还在磁盘上的合集，
+  //    同样要能出现在合并下拉框里（否则删了任务就没法合并了）
+  try {
+    const settings = getCurrentSettings();
+    const root = (settings.root && String(settings.root).trim()) ? String(settings.root).trim() : app.getPath('downloads');
+    const base = path.join(root, '抖音');
+    const registered = new Set([...groups.values()].map((g) => g.series_title));
+    if (fs.existsSync(base)) {
+      for (const name of fs.readdirSync(base)) {
+        let isDir = false;
+        try { isDir = fs.statSync(path.join(base, name)).isDirectory(); } catch (_) {}
+        if (!isDir) continue;
+        const dir = path.join(base, name);
+        let names = [];
+        try { names = fs.readdirSync(dir); } catch (_) {}
+        const count = names.filter((n) => /\.mp4$/i.test(n) && !n.includes('合集')).length;
+        if (!count) continue;
+        const title = `【抖音】${name}`;
+        if (registered.has(title)) continue;
+        groups.set('douyin:disk:' + name, {
+          series_id: 'douyin:disk:' + name,
+          series_title: title,
+          douyin: true,
+          count,
+          fromDisk: true,
+        });
+      }
+    }
+  } catch (error) {
+    console.warn('[Series] 扫描抖音目录失败:', error.message);
+  }
   return [...groups.values()];
 }
 
@@ -1424,7 +1487,7 @@ ipcMain.handle('remove-series', async (event, seriesId) => {
 });
 
 /** 批量移除没有下载过任何一集的短剧（清理浏览时留下的空档案） */
-ipcMain.handle('purge-empty-series', async () => {
+function purgeEmptySeriesEntries() {
   let removed = 0;
   for (const s of seriesRegistry) {
     if (s.dismissed) continue;
@@ -1449,7 +1512,12 @@ ipcMain.handle('purge-empty-series', async () => {
     }
   }
   if (removed > 0) saveSeriesRegistry();
-  return { success: true, count: removed };
+  return removed;
+}
+
+ipcMain.handle('purge-empty-series', async () => {
+  const count = purgeEmptySeriesEntries();
+  return { success: true, count };
 });
 
 /**
@@ -1684,8 +1752,16 @@ function resolveSeriesDir(seriesId, seriesTitle, covers) {
   if (fromTask) return fromTask.customDir;
   const settings = getCurrentSettings();
   const root = (settings.root && String(settings.root).trim()) ? String(settings.root).trim() : app.getPath('downloads');
+  // 磁盘扫描出来的合集：键里带的就是文件夹名，直接定位
+  const diskMatch = String(seriesId).match(/^douyin:disk:(.+)$/);
+  if (diskMatch) {
+    const dir = path.join(root, '抖音', diskMatch[1]);
+    if (fs.existsSync(dir)) return dir;
+  }
   const parent = isDouyinKey(seriesId) ? '抖音' : '红果短剧';
-  const guess = path.join(root, parent, sanitizeFolderName(seriesTitle) || (isDouyinKey(seriesId) ? '抖音合集' : '未命名短剧'));
+  // 展示名可能带「【抖音】」前缀，推导目录时要去掉
+  const plainTitle = String(seriesTitle || '').replace(/^【抖音】/, '');
+  const guess = path.join(root, parent, sanitizeFolderName(plainTitle) || (isDouyinKey(seriesId) ? '抖音合集' : '未命名短剧'));
   return fs.existsSync(guess) ? guess : null;
 }
 
@@ -1746,8 +1822,11 @@ ipcMain.handle('merge-series', async (event, seriesId, outputName, options) => {
     const douyinTask = isDouyinKey(sid)
       ? downloadTasks.find((t) => t.douyinInfo && taskCollectionKey(t) === sid)
       : null;
+    // 磁盘扫描出来的抖音合集（任务已删、文件还在）：键形如 douyin:disk:<文件夹名>
+    const diskMatch = sid.match(/^douyin:disk:(.+)$/);
     const seriesTitle =
       (entry && entry.series_title) ||
+      (diskMatch ? `【抖音】${diskMatch[1]}` : '') ||
       (douyinTask && douyinTask.douyinInfo && douyinTask.douyinInfo.mix_name) ||
       ((downloadTasks.find((t) => t.hongguoInfo && String(t.hongguoInfo.series_id) === sid) || {}).hongguoInfo || {}).series_title ||
       (isDouyinKey(sid) ? '抖音合集' : '未命名短剧');
@@ -3764,6 +3843,242 @@ function cleanupLegacyInstall() {
   }
 }
 
+// ===== 局域网共享：让电视 / 手机直接播放电脑里下载好的视频 =====
+// 电视端的 OK影视(FongMi/TVBox) 只吃 HTTP 的播放列表，所以这里做三件事：
+//   1. /playlist.m3u  —— 自动扫描下载目录生成 m3u（填进「直播源」即可）
+//   2. /files/<相对路径> —— 支持 Range 的流式播放（能拖动进度条）
+//   3. / —— 一个简单目录页，电视/手机浏览器也能直接点开播
+const LAN_MIME = {
+  '.mp4': 'video/mp4',
+  '.m4v': 'video/mp4',
+  '.mov': 'video/quicktime',
+  '.mkv': 'video/x-matroska',
+  '.ts': 'video/mp2t',
+  '.m3u8': 'application/vnd.apple.mpegurl',
+};
+let lanServer = null;
+let lanPort = 0;
+
+function shareRoot() {
+  const settings = getCurrentSettings();
+  return (settings.root && String(settings.root).trim()) ? String(settings.root).trim() : app.getPath('downloads');
+}
+
+/** 列出可共享的视频（只扫 抖音 / 红果短剧 两个目录，最多 3 层） */
+function listShareFiles() {
+  const root = shareRoot();
+  const out = [];
+  const walk = (dir, depth) => {
+    if (depth > 3) return;
+    let names = [];
+    try { names = fs.readdirSync(dir); } catch (_) { return; }
+    for (const n of names) {
+      const full = path.join(dir, n);
+      let st = null;
+      try { st = fs.statSync(full); } catch (_) { continue; }
+      if (st.isDirectory()) { walk(full, depth + 1); continue; }
+      if (!LAN_MIME[path.extname(n).toLowerCase()]) continue;
+      if (st.size < 1024 * 100) continue;
+      out.push({ rel: path.relative(root, full).split(path.sep).join('/'), size: st.size });
+    }
+  };
+  walk(path.join(root, '抖音'), 0);
+  walk(path.join(root, '红果短剧'), 0);
+  out.sort((a, b) => a.rel.localeCompare(b.rel, 'zh-Hans-CN'));
+  return out;
+}
+
+function shareTitle(rel) {
+  const parts = String(rel).split('/');
+  const series = parts.length > 1 ? parts[parts.length - 2] : '';
+  const name = path.basename(rel, path.extname(rel));
+  // 文件名里通常已经带序号，拼上合集名便于在电视上认
+  return [series, name].filter(Boolean).join(' ');
+}
+
+function m3uBody(host) {
+  const lines = ['#EXTM3U'];
+  for (const f of listShareFiles()) {
+    lines.push(`#EXTINF:-1,${shareTitle(f.rel)}`);
+    lines.push(`${host}/files/${f.rel.split('/').map(encodeURIComponent).join('/')}`);
+  }
+  return lines.join('\n') + '\n';
+}
+
+function shareIndexHtml(host, port) {
+  const files = listShareFiles();
+  const rows = files.map((f) => {
+    const url = `/files/${f.rel.split('/').map(encodeURIComponent).join('/')}`;
+    const size = (f.size / 1048576).toFixed(1) + ' MB';
+    return `<li><a href="${url}">${shareTitle(f.rel)}</a> <span class="s">${size}</span></li>`;
+  }).join('\n');
+  return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>果抖下载器 · 局域网共享</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#14161c;color:#e6e9ef;margin:0;padding:24px}
+h1{font-size:20px;margin:0 0 6px}
+p{color:#8a93a8;font-size:13px;margin:0 0 16px}
+code{background:#23262f;padding:2px 6px;border-radius:4px;color:#ff8fa3}
+a{color:#7cc4ff;text-decoration:none}
+li{margin:8px 0;line-height:1.5}
+.s{color:#5c6375;font-size:12px;margin-left:8px}
+</style></head><body>
+<h1>果抖下载器 · 局域网共享</h1>
+<p>共 ${files.length} 个视频 · 播放列表：<code>${host}/playlist.m3u</code></p>
+<p>电视端：OK影视 → 设置 → 直播 → 直播源，填上面这个播放列表地址。</p>
+<ul>
+${rows}
+</ul>
+</body></html>`;
+}
+
+/** 支持 Range 的静态文件响应（进度条可拖动靠它） */
+function streamShareFile(req, res, full) {
+  let st = null;
+  try { st = fs.statSync(full); } catch (_) {
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('not found');
+    return;
+  }
+  const type = LAN_MIME[path.extname(full).toLowerCase()] || 'application/octet-stream';
+  const range = req.headers.range;
+  if (range) {
+    const m = /bytes=(\d*)-(\d*)/.exec(String(range));
+    let start = m && m[1] ? parseInt(m[1], 10) : 0;
+    let end = m && m[2] ? parseInt(m[2], 10) : st.size - 1;
+    if (!Number.isFinite(start) || start < 0) start = 0;
+    if (!Number.isFinite(end) || end >= st.size) end = st.size - 1;
+    if (start > end) {
+      res.writeHead(416, { 'Content-Range': `bytes */${st.size}` });
+      res.end();
+      return;
+    }
+    res.writeHead(206, {
+      'Content-Type': type,
+      'Accept-Ranges': 'bytes',
+      'Content-Range': `bytes ${start}-${end}/${st.size}`,
+      'Content-Length': end - start + 1,
+    });
+    fs.createReadStream(full, { start, end }).pipe(res);
+    return;
+  }
+  res.writeHead(200, {
+    'Content-Type': type,
+    'Accept-Ranges': 'bytes',
+    'Content-Length': st.size,
+  });
+  fs.createReadStream(full).pipe(res);
+}
+
+function lanUrls() {
+  if (!lanServer || !lanPort) return { port: 0, urls: [], m3u: '', web: '' };
+  const urls = [];
+  try {
+    for (const list of Object.values(os.networkInterfaces())) {
+      for (const item of list || []) {
+        if (item.family !== 'IPv4' || item.internal) continue;
+        if (item.address.startsWith('169.254.')) continue;
+        urls.push(`http://${item.address}:${lanPort}`);
+      }
+    }
+  } catch (_) {}
+  if (!urls.length) urls.push(`http://127.0.0.1:${lanPort}`);
+  // 以太网/Wi-Fi 优先（WSL 的 172.x 虚拟网卡排后面）
+  urls.sort((a, b) => (a.includes('172.23.') ? 1 : 0) - (b.includes('172.23.') ? 1 : 0));
+  return { port: lanPort, urls, m3u: urls[0] + '/playlist.m3u', web: urls[0] + '/' };
+}
+
+function stopLanShare() {
+  if (!lanServer) return;
+  try { lanServer.close(); } catch (_) {}
+  lanServer = null;
+  lanPort = 0;
+  console.log('[LAN] 已停止共享');
+}
+
+function startLanShare(preferredPort) {
+  return new Promise((resolve) => {
+    if (lanServer) return resolve({ success: true, ...lanUrls() });
+    const port = Number(preferredPort) > 0 ? Number(preferredPort) : 8899;
+    const handler = (req, res) => {
+      try {
+        const parsed = new URL(req.url, 'http://localhost');
+        const host = `http://${req.headers.host || '127.0.0.1'}`;
+        if (parsed.pathname === '/' || parsed.pathname === '/index.html') {
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end(shareIndexHtml(host, lanPort));
+          return;
+        }
+        if (parsed.pathname === '/playlist.m3u' || parsed.pathname === '/playlist.txt') {
+          res.writeHead(200, { 'Content-Type': 'audio/x-mpegurl; charset=utf-8', 'Cache-Control': 'no-cache' });
+          res.end(m3uBody(host));
+          return;
+        }
+        const m = parsed.pathname.match(/^\/files\/(.+)$/);
+        if (!m) {
+          res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+          res.end('not found');
+          return;
+        }
+        const root = path.resolve(shareRoot());
+        const rel = decodeURIComponent(m[1]);
+        const full = path.resolve(root, rel);
+        // 防目录穿越：必须落在下载根目录里
+        if (full !== root && !full.startsWith(root + path.sep)) {
+          res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+          res.end('forbidden');
+          return;
+        }
+        streamShareFile(req, res, full);
+      } catch (error) {
+        try {
+          res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+          res.end('error: ' + error.message);
+        } catch (_) {}
+      }
+    };
+
+    const server = http.createServer(handler);
+    let settled = false;
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      resolve({ success: false, error: error.message });
+    };
+    server.on('error', fail);
+    server.listen(port, '0.0.0.0', () => {
+      if (settled) return;
+      settled = true;
+      lanServer = server;
+      lanPort = server.address().port;
+      const info = lanUrls();
+      console.log('[LAN] 共享已启动:', info.m3u);
+      resolve({ success: true, ...info });
+    });
+  });
+}
+
+ipcMain.handle('lan-share-start', async () => {
+  const settings = getCurrentSettings();
+  const res = await startLanShare(settings.lan_share_port);
+  if (res.success) {
+    const count = listShareFiles().length;
+    return { success: true, ...lanUrls(), count };
+  }
+  return res;
+});
+
+ipcMain.handle('lan-share-stop', async () => {
+  stopLanShare();
+  return { success: true };
+});
+
+ipcMain.handle('lan-share-status', async () => {
+  const info = lanUrls();
+  return { success: true, running: !!lanServer, ...info, count: lanServer ? listShareFiles().length : 0 };
+});
+
 app.whenReady().then(async () => {
   const dataFile = path.join(app.getPath('userData'), 'data.json');
   store.init(dataFile);
@@ -3772,6 +4087,11 @@ app.whenReady().then(async () => {
   rebuildSeriesRegistryFromTasks();
   // 任务记录可能缺失（被清空/跨会话），从磁盘补回，保证下载列表与文件一致
   try { rescanDownloadsFromDisk(); } catch (e) { console.warn('[Rescan] 启动补登记失败:', e.message); }
+  // 清理「登记了但一个文件都不剩」的空档案，避免合并下拉框与 data.json 越积越多
+  try {
+    const pruned = purgeEmptySeriesEntries();
+    if (pruned > 0) console.log(`[Cleanup] 已隐藏 ${pruned} 部没有任何文件的空档案`);
+  } catch (e) { console.warn('[Cleanup] 清理空剧集档案失败:', e.message); }
   loadMergeTasks();
   registerStreamProtocol();
   registerLocalProtocol();
@@ -3779,6 +4099,15 @@ app.whenReady().then(async () => {
 
   // 上次异常退出可能留下被残留句柄占用、删不掉的 *.enc.tmp，先清一遍
   try { cleanupStaleTempFiles(); } catch (e) { console.warn('[Cleanup] 清理残留临时文件失败:', e.message); }
+
+  // 局域网共享：设置里开着就自动起服务（电视端播放列表随时可用）
+  if (settings.lan_share_enabled === true) {
+    try {
+      const info = await startLanShare(settings.lan_share_port);
+      if (info.success) console.log('[LAN] 开机自动共享:', info.m3u);
+      else console.warn('[LAN] 自动共享失败:', info.error);
+    } catch (e) { console.warn('[LAN] 自动共享异常:', e.message); }
+  }
 
   // 改名后清掉旧版（红果短剧下载器）的快捷方式与 exe
   try { cleanupLegacyInstall(); } catch (e) { console.warn('[Cleanup] 旧版残留清理失败:', e.message); }

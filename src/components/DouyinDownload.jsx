@@ -32,6 +32,7 @@ function DouyinDownload({ onNavigate }) {
   const [progress, setProgress] = useState(null);
   const [errorMsg, setErrorMsg] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
+  const [submitMsg, setSubmitMsg] = useState(''); // 提交下载后的提示，显示在「下载选中作品」按钮右侧
   const [collection, setCollection] = useState(null);
   const [selected, setSelected] = useState(new Set());
   const [submitting, setSubmitting] = useState(false);
@@ -61,6 +62,7 @@ function DouyinDownload({ onNavigate }) {
     setProgress(null);
     setErrorMsg('');
     setSuccessMsg('');
+    setSubmitMsg('');
     setCollection(null);
     setSelected(new Set());
     try {
@@ -107,7 +109,7 @@ function DouyinDownload({ onNavigate }) {
     }
     setSubmitting(true);
     setErrorMsg('');
-    setSuccessMsg('');
+    setSubmitMsg('');
     try {
       const items = collection.items.filter((item) => selected.has(item.aweme_id));
       const res = await window.electronAPI.douyinDownloadCollection({
@@ -117,7 +119,7 @@ function DouyinDownload({ onNavigate }) {
         items,
       });
       if (res.success) {
-        setSuccessMsg(`已提交 ${res.count} 个作品到下载队列，可在「下载管理」查看进度，下载完成后可一键合并。`);
+        setSubmitMsg(`已提交 ${res.count} 个作品到下载队列，可在「下载管理」查看进度，下载完成后可一键合并。`);
       } else {
         setErrorMsg(res.error || '提交下载失败');
       }
@@ -230,7 +232,7 @@ function DouyinDownload({ onNavigate }) {
               </div>
             </div>
 
-            <div className="batch-action-bar">
+            <div className="batch-action-bar dy-batch-bar">
               <button
                 className="btn btn-primary"
                 onClick={handleDownload}
@@ -245,6 +247,8 @@ function DouyinDownload({ onNavigate }) {
                   <span>查看下载管理</span>
                 </button>
               )}
+              {/* 提交结果跟在两个按钮右侧，而不是跑到上面的解析栏 */}
+              {submitMsg && <span className="dy-submit-msg">{submitMsg}</span>}
             </div>
           </div>
 

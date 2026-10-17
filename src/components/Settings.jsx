@@ -50,12 +50,54 @@ function SettingsPage() {
   const [testing, setTesting] = useState(false);
   const [logPath, setLogPath] = useState('');
   const [login, setLogin] = useState(null);
+  const [lan, setLan] = useState({ running: false, m3u: '', web: '', count: 0 });
+  const [lanBusy, setLanBusy] = useState(false);
+  const [copiedKey, setCopiedKey] = useState('');
 
   const refreshLogin = async () => {
     if (!window.electronAPI.douyinLoginStatus) return;
     try {
       const res = await window.electronAPI.douyinLoginStatus();
       setLogin(res || null);
+    } catch (_) {}
+  };
+
+  const refreshLan = async () => {
+    if (!window.electronAPI.lanShareStatus) return;
+    try {
+      const res = await window.electronAPI.lanShareStatus();
+      if (res) setLan({ running: !!res.running, m3u: res.m3u || '', web: res.web || '', count: res.count || 0 });
+    } catch (_) {}
+  };
+
+  const toggleLan = async (enabled) => {
+    if (!window.electronAPI.lanShareStart) return;
+    setLanBusy(true);
+    try {
+      const res = enabled
+        ? await window.electronAPI.lanShareStart()
+        : await window.electronAPI.lanShareStop();
+      if (res && res.success) {
+        setLan({ running: !!enabled, m3u: res.m3u || '', web: res.web || '', count: res.count || 0 });
+      } else {
+        window.alert((res && res.error) || '局域网共享启动失败（端口可能被占用）');
+        await refreshLan();
+        return;
+      }
+    } finally {
+      setLanBusy(false);
+    }
+    update('lan_share_enabled', enabled);
+  };
+
+  const copyTo = async (text, key) => {
+    if (!text) return;
+    try {
+      const res = await window.electronAPI.copyText(text);
+      if (res && res.success) {
+        setCopiedKey(key);
+        setTimeout(() => setCopiedKey(''), 1800);
+      }
     } catch (_) {}
   };
 
@@ -67,6 +109,7 @@ function SettingsPage() {
         .catch(() => {});
     }
     refreshLogin();
+    refreshLan();
   }, []);
 
   const update = (key, value) => {
@@ -305,6 +348,48 @@ function SettingsPage() {
               刷新状态
             </button>
           </div>
+        </div>
+
+        <div className="settings-group">
+          <label className="settings-label">局域网共享（电视播放）</label>
+          <label className="proxy-switch-row">
+            <input
+              type="checkbox"
+              checked={settings.lan_share_enabled === true || lan.running}
+              disabled={lanBusy}
+              onChange={(e) => toggleLan(e.target.checked)}
+            />
+            <span className="proxy-switch-text">
+              开启局域网共享
+              <em>电脑上跑一个本地 HTTP 服务，电视/手机在同一个 Wi-Fi 下就能直接播放已下载的视频</em>
+            </span>
+          </label>
+          <div className="proxy-status-row">
+            <span className={`proxy-dot ${lan.running ? 'proxy-dot-on' : 'proxy-dot-off'}`} />
+            <span className="proxy-status-text">
+              {lan.running ? `运行中 · 共 ${lan.count} 个视频` : '未开启'}
+            </span>
+            {lan.running && (
+              <button className="btn btn-outline btn-sm" onClick={() => copyTo(lan.m3u, 'm3u')}>
+                {copiedKey === 'm3u' ? '已复制' : '复制播放列表地址'}
+              </button>
+            )}
+            {lan.running && (
+              <button className="btn btn-outline btn-sm" onClick={() => copyTo(lan.web, 'web')}>
+                {copiedKey === 'web' ? '已复制' : '复制目录页地址'}
+              </button>
+            )}
+          </div>
+          {lan.running && (
+            <p className="settings-hint">
+              电视端（OK影视 / FongMi）：设置 → 直播 → 直播源，填 <code>{lan.m3u}</code>
+              <br />
+              手机或电脑浏览器直接打开 <code>{lan.web}</code> 也能播
+            </p>
+          )}
+          <p className="settings-hint">
+            首次开启若 Windows 弹出防火墙提示，请勾选「专用网络」允许，否则电视连不上。
+          </p>
         </div>
 
         <div className="settings-group">

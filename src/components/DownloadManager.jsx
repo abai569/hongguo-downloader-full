@@ -45,7 +45,7 @@ function fmtBytes(bytes) {
   return v.toFixed(v >= 100 || i === 0 ? 0 : 1) + ' ' + units[i];
 }
 
-function DownloadManager({ onNavigate }) {
+function DownloadManager({ onNavigate, active }) {
   const [tasks, setTasks] = useState([]);
   const [selected, setSelected] = useState(new Set());
   const [toast, setToast] = useState(null);
@@ -153,6 +153,14 @@ function DownloadManager({ onNavigate }) {
     loadSeriesList();
     loadMergeTasks();
   }, [refresh, loadSeriesList, loadMergeTasks]);
+
+  // 页面是保活的（切走只隐藏），所以每次切回来都要重新拉一遍，
+  // 否则合并下拉框里会一直挂着已经删掉的剧
+  useEffect(() => {
+    if (!active) return;
+    loadSeriesList();
+    loadMergeTasks();
+  }, [active, loadSeriesList, loadMergeTasks]);
 
   // 队列状态轮询：让「进行中 x / 并发上限 y」实时可见
   useEffect(() => {

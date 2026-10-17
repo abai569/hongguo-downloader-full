@@ -98,7 +98,7 @@ export default function App() {
     { id: 'browse', node: <Browse onNavigate={setPage} /> },
     { id: 'download', node: <HongguoDownload onNavigate={setPage} /> },
     { id: 'douyin', node: <DouyinDownload onNavigate={setPage} /> },
-    { id: 'manager', node: <DownloadManager onNavigate={setPage} /> },
+    { id: 'manager', node: <DownloadManager onNavigate={setPage} active={page === 'manager'} /> },
     { id: 'settings', node: <SettingsPage /> },
   ];
 
