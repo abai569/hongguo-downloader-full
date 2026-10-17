@@ -79,6 +79,31 @@ function sanitizeName(name) {
     .slice(0, 60);
 }
 
+/** 清掉页面/接口标题里的站名、书名号、分集后缀等噪音 */
+function cleanTitle(raw) {
+  const text = String(raw || '').trim();
+  if (!text) return '';
+  let name = text
+    // 只有跟在分隔符后面才算站名后缀，避免「重生之我在抖音」被削掉
+    .replace(/[_|·•\-—–\s]+(抖音短剧|抖音小助手|抖音号|抖音)\s*$/i, '')
+    .replace(/^(抖音短剧|抖音)[\s:：\-]+/i, '')
+    .replace(/[_|·•\-—–\s]+DOU\+?.*$/i, '')
+    .replace(/《|》|【|】/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (/^(抖音|douyin|短剧|合集)$/i.test(name)) return '';
+  return sanitizeName(name);
+}
+
+/** 判断一个名字能不能当合集名（排除「第3集」「12」这类） */
+function usableName(raw) {
+  const name = cleanTitle(raw);
+  if (!name || name.length < 2) return '';
+  if (/^第?\s*\d+\s*[集期话回]?$/.test(name)) return '';
+  if (/^\d+$/.test(name)) return '';
+  return name;
+}
+
 function extractUrl(text) {
   const match = String(text || '').match(/https?:\/\/[^\s"'<>，。]+/i);
   return match ? match[0] : '';
@@ -335,6 +360,53 @@ function normalizeAweme(aweme, index) {
   };
 }
 
+/**
+ * 从接口 JSON 里找合集/短剧名。
+ * 没文案时这是主要的命名来源，所以按字段可信度排序，
+ * 泛化的 title/name 只在同层带 ID 字段时才采信，避免误抓 BGM 名、作者昵称。
+ */
+const NAME_KEYS = [
+  'mix_name', 'mixName',
+  'playlet_name', 'playletName', 'playlet_title',
+  'series_name', 'seriesName', 'series_title',
+  'collection_name', 'share_title',
+  'title', 'name',
+];
+const ID_KEYS = ['playlet_id', 'mix_id', 'series_id', 'collection_id', 'id'];
+const GENERIC_NAME_KEYS = new Set(['title', 'name']);
+
+function nameFromJson(node, state, depth = 0) {
+  if (state.name || !node || depth > 6) return;
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      if (state.name) return;
+      nameFromJson(item, state, depth + 1);
+    }
+    return;
+  }
+  if (typeof node !== 'object') return;
+
+  for (const key of NAME_KEYS) {
+    const value = node[key];
+    if (typeof value !== 'string') continue;
+    if (GENERIC_NAME_KEYS.has(key)) {
+      const hasId = ID_KEYS.some((idKey) => node[idKey] !== undefined && node[idKey] !== null && node[idKey] !== '');
+      if (!hasId || depth > 4) continue;
+    }
+    const cleaned = cleanTitle(value);
+    if (!cleaned || cleaned.length < 2) continue;
+    if (/^第?\s*\d+\s*[集期话回]/.test(cleaned)) continue;
+    state.name = cleaned;
+    log('[capture] 名称候选 ' + key + ' -> ' + cleaned);
+    return;
+  }
+
+  for (const key of Object.keys(node)) {
+    const value = node[key];
+    if (value && typeof value === 'object') nameFromJson(value, state, depth + 1);
+  }
+}
+
 const GENERIC_API = /\/aweme\/|\/playlet\/|\/series\/|\/mix\/|\/episode\//;
 
 /**
@@ -425,7 +497,7 @@ async function capturePage(pageUrlOrId, options) {
     },
   });
 
-  const state = { pages: [], hasMore: true, bodies: 0, seen: 0, media: [] };
+  const state = { pages: [], hasMore: true, bodies: 0, seen: 0, media: [], name: '' };
   let attached = false;
 
   // 事件驱动的"首批数据到达"等待：轮询会有 400ms 抖动，这里一有数据立刻醒
@@ -492,6 +564,7 @@ async function capturePage(pageUrlOrId, options) {
           });
           const json = JSON.parse(body);
           state.bodies += 1;
+          nameFromJson(json, state);
 
           if (Array.isArray(json.aweme_list) && json.aweme_list.length) {
             state.pages.push(json);
@@ -598,11 +671,11 @@ async function capturePage(pageUrlOrId, options) {
       const domIds = await scrapeDomIds(win);
       log('[capture] DOM 兜底 id 数=' + domIds.length);
       if (domIds.length) {
-        return { pages: state.pages, domIds, media: state.media, mixName, author, pageTitle };
+        return { pages: state.pages, domIds, media: state.media, mixName, author, pageTitle, detectedName: state.name };
       }
     }
 
-    return { pages: state.pages, domIds: [], media: state.media, mixName, author, pageTitle };
+    return { pages: state.pages, domIds: [], media: state.media, mixName, author, pageTitle, detectedName: state.name };
   } finally {
     try {
       if (attached) win.webContents.debugger.detach();
@@ -875,7 +948,7 @@ async function resolveCollection(input, options = {}) {
 
   // 分享文案里常带【剧名】，比 合集<id> 友好得多
   const bracketMatch = String(input || '').match(/[【\[]([^】\]]{2,40})[】\]]/);
-  const titleHint = bracketMatch ? sanitizeName(bracketMatch[1]) : '';
+  const titleHint = bracketMatch ? usableName(bracketMatch[1]) : '';
   if (titleHint) log('[input] 文案标题=' + titleHint);
 
   onProgress({ stage: 'opening', pages: 0, found: 0 });
@@ -891,10 +964,11 @@ async function resolveCollection(input, options = {}) {
       log('[result] 失败：没有解析到任何作品（' + urlPath(pageUrl) + '）');
       throw new Error('未能解析出作品列表；若页面要求验证，请到设置里打开「解析合集时显示窗口」后重试');
     }
-    const mixName = sanitizeName(captured.mixName)
-      || sanitizeName(hintName)
-      || titleHint
-      || sanitizeName(captured.pageTitle)
+    const mixName = usableName(captured.mixName)
+      || usableName(captured.detectedName)
+      || usableName(hintName)
+      || usableName(titleHint)
+      || usableName(captured.pageTitle)
       || `合集${String(keyId).slice(-6)}`;
     const result = collectionResult(keyId, mixName, captured.author, items);
     log(
@@ -943,6 +1017,7 @@ module.exports = {
   UA,
   REFERER,
   sanitizeName,
+  cleanTitle,
   resolveCollection,
   resolvePlayUrl,
   resolveCollectionTarget,
