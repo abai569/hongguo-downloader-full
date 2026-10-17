@@ -85,78 +85,190 @@ function extractUrl(text) {
 }
 
 /** 从合集页面 URL 里取 mix_id（只认合集形态，单条作品另走视频解析） */
-function mixIdFromUrl(url) {
-  if (!url) return '';
-  const patterns = [
+/**
+ * 从任意文本（URL / HTML / 内嵌 JSON）里识别合集或作品 ID。
+ * 抖音分享页常见三种形态：页面地址、`"mix_id":"123"`、`/video/123`。
+ */
+function idFromAnyText(text) {
+  if (!text) return null;
+  const source = String(text);
+
+  // 抖音短剧（playlet）：分享链接最外层形态，优先识别
+  const playletPatterns = [
+    /\/share\/playlet\/detail\/(\d{6,})/,
+    /\/playlet\/(?:detail\/)?(\d{6,})/,
+    /[?&]playlet_id=(\d{6,})/,
+    /"playlet_id"\s*:\s*"?(\d{6,})/,
+  ];
+  for (const pattern of playletPatterns) {
+    const match = source.match(pattern);
+    if (match) return { kind: 'playlet', id: match[1] };
+  }
+
+  const mixPatterns = [
     /\/collection\/(\d{6,})/,
     /\/share\/collection\/(\d{6,})/,
     /[?&]mix_id=(\d{6,})/,
+    /"mix_id"\s*:\s*"?(\d{6,})/,
+    /[?&]collection_id=(\d{6,})/,
   ];
-  for (const pattern of patterns) {
-    const match = url.match(pattern);
-    if (match) return match[1];
+  for (const pattern of mixPatterns) {
+    const match = source.match(pattern);
+    if (match) return { kind: 'collection', id: match[1] };
   }
-  return '';
-}
 
-/** 从作品页面 URL 里取 aweme_id */
-function videoIdFromUrl(url) {
-  if (!url) return '';
-  const patterns = [
+  const videoPatterns = [
     /\/video\/(\d{6,})/,
     /\/share\/video\/(\d{6,})/,
     /[?&]modal_id=(\d{6,})/,
     /[?&]aweme_id=(\d{6,})/,
+    /"aweme_id"\s*:\s*"?(\d{6,})/,
   ];
-  for (const pattern of patterns) {
-    const match = url.match(pattern);
-    if (match) return match[1];
+  for (const pattern of videoPatterns) {
+    const match = source.match(pattern);
+    if (match) return { kind: 'video', id: match[1] };
   }
-  return '';
+
+  return null;
 }
 
-/** 短链跟随跳转，拿到真实地址 */
-async function followRedirect(url) {
+/**
+ * 纯 HTTP 跟短链：手动逐跳读 Location，并对落地页 HTML 做一次 ID 扫描。
+ * 抖音短链有时是 302，有时是返回一段带跳转的 HTML，两种都覆盖。
+ */
+async function followHttp(url) {
+  let current = url;
+
+  for (let hop = 0; hop < 8; hop++) {
+    const direct = idFromAnyText(current);
+    if (direct) {
+      log('[target] http 命中', direct.kind, direct.id, 'via=url hop=' + hop);
+      return direct;
+    }
+
+    let response;
+    try {
+      response = await axios.get(current, {
+        headers: {
+          'User-Agent': MOBILE_UA,
+          Accept: 'text/html,application/xhtml+xml,*/*',
+        },
+        maxRedirects: 0,
+        timeout: 15000,
+        validateStatus: () => true,
+        responseType: 'text',
+      });
+    } catch (error) {
+      log('[target] http 第' + hop + '跳失败:', error.message);
+      return null;
+    }
+
+    const location = response.headers && response.headers.location;
+    const body = typeof response.data === 'string' ? response.data : '';
+    log(
+      '[target] http hop=' + hop,
+      'status=' + response.status,
+      'location=' + (location ? urlPath(location) : '无'),
+      'bodyLen=' + body.length
+    );
+
+    if (location) {
+      current = /^https?:\/\//i.test(location) ? location : new URL(location, current).toString();
+      continue;
+    }
+
+    const fromBody = idFromAnyText(body);
+    if (fromBody) {
+      log('[target] http 命中', fromBody.kind, fromBody.id, 'via=html hop=' + hop);
+      return fromBody;
+    }
+    break;
+  }
+
+  return null;
+}
+
+/** 最后兜底：用隐藏窗口真实打开一次，让浏览器自己走完跳转 */
+async function resolveViaWindow(url, showWindow) {
+  const { BrowserWindow } = require('electron');
+  const win = new BrowserWindow({
+    width: 1120,
+    height: 820,
+    show: !!showWindow,
+    title: '抖音链接解析',
+    webPreferences: { sandbox: false, contextIsolation: true, nodeIntegration: false },
+  });
+
   try {
-    const response = await axios.get(url, {
-      headers: { 'User-Agent': MOBILE_UA },
-      maxRedirects: 10,
-      timeout: 15000,
-      validateStatus: () => true,
-    });
-    const finalUrl = (response.request && response.request.res && response.request.res.responseUrl) || url;
-    return { finalUrl, html: typeof response.data === 'string' ? response.data : '' };
+    win.webContents.setUserAgent(UA);
+    win.webContents.on('did-fail-load', (_e, code, desc, failedUrl) =>
+      log('[target] 窗口 did-fail-load', code, desc, urlPath(failedUrl)));
+    await win.loadURL(url, { userAgent: UA });
+    await delay(2500);
+
+    const finalUrl = win.webContents.getURL();
+    log('[target] 窗口落地', urlPath(finalUrl));
+    let found = idFromAnyText(finalUrl);
+    if (found) {
+      log('[target] 窗口命中', found.kind, found.id, 'via=url');
+      return found;
+    }
+
+    let html = '';
+    try {
+      html = await win.webContents.executeJavaScript('document.documentElement.outerHTML', true);
+    } catch (error) {
+      log('[target] 读取页面失败:', error.message);
+    }
+    found = idFromAnyText(html);
+    if (found) {
+      log('[target] 窗口命中', found.kind, found.id, 'via=html');
+      return found;
+    }
+    try {
+      log('[target] 窗口标题=' + JSON.stringify(await win.webContents.getTitle()));
+    } catch (_) {}
+    return null;
   } catch (error) {
-    return { finalUrl: url, html: '' };
+    log('[target] 窗口打开失败:', error.message);
+    return null;
+  } finally {
+    try {
+      if (!win.isDestroyed()) win.destroy();
+    } catch (_) {}
   }
 }
 
 /**
- * 识别用户输入：合集链接 / 短链 / 分享文案 / 纯数字 mix_id。
- * 返回 { mixId, pageUrl }。
+ * 识别用户输入：合集链接 / 作品链接 / 短链 / 分享文案 / 纯数字 ID。
+ * 依次尝试：直接匹配 → HTTP 跟跳转 → 窗口真实打开。
  */
-async function resolveCollectionTarget(input) {
+async function resolveCollectionTarget(input, options = {}) {
   const text = String(input || '').trim();
   if (!text) throw new Error('请粘贴抖音合集分享链接或分享文案');
 
   const url = extractUrl(text);
   if (!url && /^\d{15,}$/.test(text)) {
+    log('[target] 纯 ID 视为单作品', text);
     return { kind: 'video', id: text };
   }
   if (!url) throw new Error('没有找到链接，请粘贴完整分享文案或合集地址');
 
-  let current = url;
-  let mixId = mixIdFromUrl(current);
-  let videoId = videoIdFromUrl(current);
-  if (!mixId && !videoId && /v\.douyin\.com|iesdouyin\.com/i.test(current)) {
-    const { finalUrl } = await followRedirect(current);
-    current = finalUrl || current;
-    mixId = mixIdFromUrl(current);
-    videoId = videoIdFromUrl(current);
+  const direct = idFromAnyText(url);
+  if (direct) {
+    log('[target] 直接命中', direct.kind, direct.id);
+    return direct;
   }
-  if (mixId) return { kind: 'collection', id: mixId };
-  if (videoId) return { kind: 'video', id: videoId };
-  throw new Error('无法识别的链接：请粘贴抖音合集页或作品的分享链接');
+
+  log('[target] 短链，开始 HTTP 跟随:', urlPath(url));
+  const viaHttp = await followHttp(url);
+  if (viaHttp) return viaHttp;
+
+  log('[target] HTTP 未识别，改用窗口跟随');
+  const viaWindow = await resolveViaWindow(url, options.showWindow);
+  if (viaWindow) return viaWindow;
+
+  throw new Error('无法识别该链接指向的合集或作品；可在设置里打开「解析合集时显示窗口」后重试，看实际落地的页面');
 }
 
 function pickCover(video, aweme) {
@@ -166,6 +278,18 @@ function pickCover(video, aweme) {
   if (first) return first;
   const dynamic = (video && video.dynamic_cover && video.dynamic_cover.url_list) || [];
   return dynamic.find((item) => typeof item === 'string' && /^https?:\/\//.test(item)) || '';
+}
+
+/** 作品归属的合集信息（抖音把合集挂在 mix_info 上） */
+function mixFromAweme(item) {
+  const mix = (item && (item.mix_info || item.mixInfo)) || null;
+  if (!mix) return null;
+  const id = mix.mix_id || mix.mixId;
+  if (!id) return null;
+  return {
+    mix_id: String(id),
+    mix_name: String(mix.mix_name || mix.mixName || '').trim(),
+  };
 }
 
 /** 挑选无水印直链：bit_rate 高清优先，其次 play_addr，最后 download_addr 去水印 */
@@ -206,15 +330,79 @@ function normalizeAweme(aweme, index) {
   };
 }
 
+const GENERIC_API = /\/aweme\/|\/playlet\/|\/series\/|\/mix\/|\/episode\//;
+
 /**
- * 在隐藏窗口里打开合集页，用 CDP 抓抖音自己发出的 mix/aweme 响应，
- * 并自动滚动触发分页。任一环节失败时退回 DOM 抓作品 ID。
+ * 递归扫描任意 JSON，找出"能下载的视频节点"。
+ * 短剧、合集、主页的接口返回结构各不相同（aweme_list / video_list / episode_list …），
+ * 用这个兜底而不是逐个接口写解析，接口改名也不会整条链路失效。
  */
-async function captureCollection(mixId, options) {
+function deepCollectMedia(node, out, depth, trail) {
+  if (!node || depth > 8 || out.length > 3000) return;
+
+  if (Array.isArray(node)) {
+    for (let i = 0; i < node.length; i++) {
+      deepCollectMedia(node[i], out, depth + 1, trail + '[' + i + ']');
+    }
+    return;
+  }
+  if (typeof node !== 'object') return;
+
+  const video = node.video || null;
+  const id = String(
+    node.aweme_id || node.awemeId || node.vid || node.video_id || node.item_id || ''
+  );
+  let url = video ? pickVideoUrl(video) : '';
+  if (!url) {
+    const raw =
+      node.play_url ||
+      node.playUrl ||
+      node.video_url ||
+      node.videoUrl ||
+      (node.play_addr && node.play_addr.url_list && node.play_addr.url_list[0]);
+    if (typeof raw === 'string' && /^https?:\/\//.test(raw)) {
+      url = raw.replace(/\/playwm\//g, '/play/').replace(/playwm/g, 'play');
+    }
+  }
+
+  if (url && id) {
+    const title = String(node.desc || node.title || node.name || node.episode_title || '').trim();
+    const cover = video ? pickCover(video, node) : String(node.cover || node.cover_url || '');
+    const duration = video && video.duration
+      ? Math.round(video.duration / 1000)
+      : (Number(node.duration) > 1000 ? Math.round(Number(node.duration) / 1000) : Number(node.duration) || 0);
+    out.push({ id, title, cover, duration, url, trail });
+  }
+
+  for (const key of Object.keys(node)) {
+    const value = node[key];
+    if (value && typeof value === 'object') deepCollectMedia(value, out, depth + 1, trail + '.' + key);
+  }
+}
+
+function mergeMedia(target, found) {
+  if (!found.length) return 0;
+  const known = new Set(target.map((item) => item.id));
+  let added = 0;
+  for (const item of found) {
+    if (known.has(item.id)) continue;
+    known.add(item.id);
+    target.push(item);
+    added += 1;
+  }
+  return added;
+}
+
+/**
+ * 在隐藏窗口里打开页面，用 CDP 抓页面自己发出的签名请求。
+ * 合集页命中 mix/aweme 拿列表；短剧页结构不同，靠 deepCollectMedia 从任意接口里捞视频。
+ */
+async function capturePage(pageUrlOrId, options) {
   const { BrowserWindow } = require('electron');
   const showWindow = options && options.showWindow;
   const onProgress = (options && options.onProgress) || (() => {});
-  const pageUrl = `https://www.douyin.com/collection/${mixId}`;
+  const raw = String(pageUrlOrId || '');
+  const pageUrl = /^https?:\/\//i.test(raw) ? raw : `https://www.douyin.com/collection/${raw}`;
 
   const win = new BrowserWindow({
     width: 1120,
@@ -224,7 +412,7 @@ async function captureCollection(mixId, options) {
     webPreferences: { sandbox: false, contextIsolation: true, nodeIntegration: false },
   });
 
-  const state = { pages: [], hasMore: true, bodies: 0, seen: 0 };
+  const state = { pages: [], hasMore: true, bodies: 0, seen: 0, media: [] };
   let attached = false;
 
   log('[capture] open', pageUrl, 'showWindow=' + !!showWindow);
@@ -247,34 +435,53 @@ async function captureCollection(mixId, options) {
         const url = params && params.response && params.response.url;
         if (!url) return;
         const status = params.response.status;
+        const generic = GENERIC_API.test(url);
 
-        // 把页面实际发出的 aweme 系请求都记下来：
+        // 把页面实际发出的接口都记下来：
         // 接口一旦改名，这里能直接看出应该匹配什么路径
-        if (/\/aweme\//.test(url) || /\/mix\//.test(url)) {
+        if (generic) {
           if (state.seen < 80) {
             state.seen += 1;
             log('[capture] resp', status, urlPath(url));
           }
         }
 
-        if (!PAGE_API.test(url)) return;
+        if (!PAGE_API.test(url) && !generic) return;
         try {
           const { body } = await debuggerApi.sendCommand('Network.getResponseBody', {
             requestId: params.requestId,
           });
-          log('[capture] hit', urlPath(url), 'bodyLen=' + (body ? body.length : 0));
           const json = JSON.parse(body);
           state.bodies += 1;
-          if (Array.isArray(json.aweme_list)) state.pages.push(json);
-          if (json.has_more === false) state.hasMore = false;
-          log(
-            '[capture] page#' + state.bodies,
-            'list=' + ((json.aweme_list && json.aweme_list.length) || 0),
-            'total=' + countItems(state.pages),
-            'has_more=' + json.has_more,
-            'cursor=' + json.cursor
-          );
-          onProgress({ stage: 'page', pages: state.bodies, found: countItems(state.pages) });
+
+          if (Array.isArray(json.aweme_list) && json.aweme_list.length) {
+            state.pages.push(json);
+            if (json.has_more === false) state.hasMore = false;
+            log(
+              '[capture] 列表页#' + state.pages.length,
+              'list=' + json.aweme_list.length,
+              'total=' + countItems(state.pages),
+              'has_more=' + json.has_more,
+              'cursor=' + json.cursor
+            );
+            onProgress({ stage: 'page', pages: state.pages.length, found: countItems(state.pages) });
+          }
+
+          // 不论什么接口，都顺手扫一遍视频节点：短剧页不走 aweme_list
+          const found = [];
+          deepCollectMedia(json, found, 0, '');
+          if (found.length) {
+            const added = mergeMedia(state.media, found);
+            log(
+              '[capture] 媒体节点',
+              urlPath(url),
+              'found=' + found.length,
+              'new=' + added,
+              'total=' + state.media.length,
+              'trail=' + found[0].trail
+            );
+            onProgress({ stage: 'page', pages: state.bodies, found: state.media.length });
+          }
         } catch (error) {
           log('[capture] body-fail', urlPath(url), error.message);
         }
@@ -292,20 +499,20 @@ async function captureCollection(mixId, options) {
     } catch (_) {}
 
     const startedAt = Date.now();
-    while (Date.now() - startedAt < FIRST_PAGE_TIMEOUT_MS && state.pages.length === 0) {
+    while (Date.now() - startedAt < FIRST_PAGE_TIMEOUT_MS && !hasCapture(state)) {
       await delay(400);
     }
-    if (state.pages.length === 0) {
-      log('[capture] 首屏超时，未捕获到页面列表（waitMs=' + (Date.now() - startedAt) + '）');
+    if (!hasCapture(state)) {
+      log('[capture] 首屏超时，未捕获到任何作品（waitMs=' + (Date.now() - startedAt) + '）');
     }
 
     let lastCount = -1;
     let stable = 0;
     for (let i = 0; i < MAX_SCROLLS; i++) {
-      const count = countItems(state.pages);
+      const count = mediaCount(state);
       if (count === lastCount) stable += 1;
       else stable = 0;
-      if (state.pages.length > 0 && (!state.hasMore || stable >= 3)) break;
+      if (hasCapture(state) && (!state.hasMore || stable >= 3)) break;
       lastCount = count;
       try {
         await win.webContents.executeJavaScript(
@@ -314,9 +521,14 @@ async function captureCollection(mixId, options) {
         );
       } catch (_) {}
       await delay(SCROLL_WAIT_MS);
-      onProgress({ stage: 'scroll', pages: state.bodies, found: countItems(state.pages) });
+      onProgress({ stage: 'scroll', pages: state.bodies, found: mediaCount(state) });
     }
-    log('[capture] scroll 结束 total=' + countItems(state.pages) + ' pages=' + state.bodies + ' hasMore=' + state.hasMore);
+    log(
+      '[capture] scroll 结束 total=' + mediaCount(state) +
+      ' pages=' + state.pages.length +
+      ' bodies=' + state.bodies +
+      ' hasMore=' + state.hasMore
+    );
 
     let mixName = '';
     let author = '';
@@ -326,15 +538,15 @@ async function captureCollection(mixId, options) {
       if (!author && info && info.author && info.author.nickname) author = info.author.nickname;
     }
 
-    if (!countItems(state.pages)) {
+    if (!hasCapture(state)) {
       const domIds = await scrapeDomIds(win);
       log('[capture] DOM 兜底 id 数=' + domIds.length);
       if (domIds.length) {
-        return { pages: state.pages, domIds, mixName, author };
+        return { pages: state.pages, domIds, media: state.media, mixName, author };
       }
     }
 
-    return { pages: state.pages, domIds: [], mixName, author };
+    return { pages: state.pages, domIds: [], media: state.media, mixName, author };
   } finally {
     try {
       if (attached) win.webContents.debugger.detach();
@@ -349,6 +561,16 @@ function countItems(pages) {
   let total = 0;
   for (const page of pages) total += (page.aweme_list || []).length;
   return total;
+}
+
+/** 已抓到的作品总数：列表接口优先，其次通用媒体节点 */
+function mediaCount(state) {
+  const fromPages = countItems(state.pages);
+  return fromPages > 0 ? fromPages : state.media.length;
+}
+
+function hasCapture(state) {
+  return countItems(state.pages) > 0 || state.media.length > 0;
 }
 
 /** 兜底：从渲染后的 DOM 里收集作品 ID */
@@ -400,6 +622,8 @@ async function resolvePlayUrl(awemeId) {
           const url = pickVideoUrl(item.video || {});
           log('[detail] item_list=' + itemList.length + ' playUrl=' + (url ? urlPath(url) : '空'));
           if (url) {
+            const mix = mixFromAweme(item);
+            if (mix) log('[detail] 归属合集 ' + mix.mix_id + ' 「' + mix.mix_name + '」');
             return {
               url,
               referer: REFERER,
@@ -407,6 +631,7 @@ async function resolvePlayUrl(awemeId) {
               cover: pickCover(item.video || {}, item),
               duration: item.video && item.video.duration ? Math.round(item.video.duration / 1000) : 0,
               type: Array.isArray(item.images) && item.images.length ? 'images' : 'video',
+              mix,
             };
           }
         }
@@ -471,7 +696,9 @@ async function resolveByCapture(awemeId) {
           cover: pickCover(item.video || {}, item),
           duration: item.video && item.video.duration ? Math.round(item.video.duration / 1000) : 0,
           type: 'video',
+          mix: mixFromAweme(item),
         };
+        if (result.mix) log('[detail] 归属合集 ' + result.mix.mix_id + ' 「' + result.mix.mix_name + '」');
       } catch (error) {
         log('[detail] body-fail', urlPath(url), error.message);
       }
@@ -499,51 +726,11 @@ async function resolveByCapture(awemeId) {
   }
 }
 
-/** 解析合集：列表 + 无水印直链；粘贴单条作品链接时退化为单作品解析 */
-async function resolveCollection(input, options = {}) {
-  resetLogIfLarge();
-  log('===== 开始解析 =====');
-  log('[input]', JSON.stringify(String(input || '').slice(0, 200)));
-
-  const target = await resolveCollectionTarget(input);
-  log('[target] kind=' + target.kind + ' id=' + target.id);
-
-  const onProgress = options.onProgress || (() => {});
-  onProgress({ stage: 'opening', pages: 0, found: 0 });
-
-  if (target.kind === 'video') {
-    const info = await resolvePlayUrl(target.id);
-    const title = sanitizeName(info.title) || `作品${target.id.slice(-6)}`;
-    const item = {
-      aweme_id: target.id,
-      index: 1,
-      title: info.title || title,
-      cover: info.cover || '',
-      duration: info.duration || 0,
-      url: info.url,
-      type: info.type || 'video',
-      music: '',
-    };
-    const usable = item.type === 'video' && item.url;
-    return {
-      mix_id: target.id,
-      mix_name: title,
-      author: '',
-      total: 1,
-      videos: usable ? 1 : 0,
-      images: usable ? 0 : 1,
-      items: [item],
-      single: true,
-    };
-  }
-
-  const captured = await captureCollection(target.id, {
-    showWindow: options.showWindow,
-    onProgress,
-  });
-
+/** 抓包结果 -> 作品列表（列表接口优先，其次通用媒体节点，最后 DOM 逐条补解析） */
+async function itemsFromCapture(captured, onProgress) {
   const items = [];
   const seen = new Set();
+
   for (const page of captured.pages) {
     for (const aweme of page.aweme_list || []) {
       const id = String((aweme && aweme.aweme_id) || '');
@@ -551,6 +738,25 @@ async function resolveCollection(input, options = {}) {
       seen.add(id);
       items.push(normalizeAweme(aweme, items.length + 1));
     }
+  }
+
+  // 短剧等页面不走 aweme_list，用通用扫描结果
+  if (!items.length && (captured.media || []).length) {
+    for (const media of captured.media) {
+      if (!media.url || !media.id || seen.has(media.id)) continue;
+      seen.add(media.id);
+      items.push({
+        aweme_id: media.id,
+        index: items.length + 1,
+        title: media.title || `第 ${items.length + 1} 集`,
+        cover: media.cover || '',
+        duration: media.duration || 0,
+        url: media.url,
+        type: 'video',
+        music: '',
+      });
+    }
+    log('[capture] 用通用媒体节点组装 ' + items.length + ' 条');
   }
 
   if (!items.length && captured.domIds.length) {
@@ -573,30 +779,91 @@ async function resolveCollection(input, options = {}) {
     }
   }
 
-  if (!items.length) {
-    log('[result] 失败：没有解析到任何作品');
-    throw new Error('未能获取合集作品列表；若页面要求验证，请到设置里打开「显示解析窗口」后重试');
-  }
+  // play_url 一并带给下载端：首次下载直接用，省一次解析
+  return items.map((item) => ({ ...item, play_url: item.url || '' }));
+}
 
-  const mixName = sanitizeName(captured.mixName) || `合集${target.id.slice(-6)}`;
+function collectionResult(mixId, mixName, author, items, extra = {}) {
   const usableCount = items.filter((item) => item.type === 'video' && item.url).length;
-  log(
-    '[result] 成功 mix=' + JSON.stringify(mixName),
-    'total=' + items.length,
-    'videos=' + usableCount,
-    'images=' + (items.length - usableCount),
-    'source=' + (captured.pages.length ? 'cdp' : 'dom')
-  );
-
   return {
-    mix_id: target.id,
+    mix_id: String(mixId),
     mix_name: mixName,
-    author: captured.author || '',
+    author: author || '',
     total: items.length,
     videos: usableCount,
     images: items.filter((item) => item.type !== 'video').length,
     items,
+    ...extra,
   };
+}
+
+/**
+ * 解析入口。三种输入都走同一条流水线：
+ *   合集页 → 打开合集页抓 mix/aweme
+ *   短剧页 → 打开短剧分享页，用通用扫描捞各集
+ *   单作品 → 先取详情，若属于合集/短剧则顺势解析整部
+ */
+async function resolveCollection(input, options = {}) {
+  resetLogIfLarge();
+  log('===== 开始解析 =====');
+  log('[input]', JSON.stringify(String(input || '').slice(0, 200)));
+
+  const onProgress = options.onProgress || (() => {});
+  const target = await resolveCollectionTarget(input, { showWindow: options.showWindow });
+  log('[target] kind=' + target.kind + ' id=' + target.id);
+  onProgress({ stage: 'opening', pages: 0, found: 0 });
+
+  const readPage = async (pageUrl, keyId, hintName) => {
+    const captured = await capturePage(pageUrl, {
+      showWindow: options.showWindow,
+      onProgress,
+    });
+    const items = await itemsFromCapture(captured, onProgress);
+    if (!items.length) {
+      log('[result] 失败：没有解析到任何作品（' + urlPath(pageUrl) + '）');
+      throw new Error('未能解析出作品列表；若页面要求验证，请到设置里打开「解析合集时显示窗口」后重试');
+    }
+    const mixName = sanitizeName(captured.mixName) || sanitizeName(hintName) || `合集${String(keyId).slice(-6)}`;
+    const result = collectionResult(keyId, mixName, captured.author, items);
+    log(
+      '[result] 成功 name=' + JSON.stringify(mixName),
+      'total=' + result.total,
+      'videos=' + result.videos,
+      'images=' + result.images,
+      'source=' + (captured.pages.length ? 'cdp-list' : (captured.media.length ? 'cdp-media' : 'dom'))
+    );
+    return result;
+  };
+
+  if (target.kind === 'collection') {
+    return readPage(`https://www.douyin.com/collection/${target.id}`, target.id);
+  }
+
+  if (target.kind === 'playlet') {
+    return readPage(`https://www.iesdouyin.com/share/playlet/detail/${target.id}/`, target.id);
+  }
+
+  // 单条作品：先取详情，若属于合集则顺势解析整部
+  const info = await resolvePlayUrl(target.id);
+  if (info.mix && info.mix.mix_id) {
+    log('[result] 作品属于合集 ' + info.mix.mix_id + ' 「' + (info.mix.mix_name || '') + '」，改为解析整部');
+    return readPage(`https://www.douyin.com/collection/${info.mix.mix_id}`, info.mix.mix_id, info.mix.mix_name);
+  }
+
+  log('[result] 单作品（无归属合集）');
+  const title = sanitizeName(info.title) || `作品${target.id.slice(-6)}`;
+  const item = {
+    aweme_id: target.id,
+    index: 1,
+    title: info.title || title,
+    cover: info.cover || '',
+    duration: info.duration || 0,
+    url: info.url,
+    type: info.type || 'video',
+    music: '',
+    play_url: info.url || '',
+  };
+  return collectionResult(target.id, title, '', [item], { single: true });
 }
 
 module.exports = {

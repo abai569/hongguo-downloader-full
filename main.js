@@ -898,8 +898,14 @@ async function downloadDouyinVideo(task, attempt) {
   task.error = '';
   sendToRenderer('download-progress', { id, progress: 0, receivedBytes: 0, totalBytes: 0, message: '' });
 
-  // 直链带签名且有时效，每次尝试都重新解析
-  const play = await douyin.resolvePlayUrl(info.aweme_id);
+  // 直链带签名且有时效：首次直接用解析时拿到的地址，重试时重新解析
+  let play = null;
+  if (attempt === 1 && info.play_url) {
+    play = { url: info.play_url, referer: douyin.REFERER };
+    console.log('[Douyin] 使用解析阶段的直链');
+  } else {
+    play = await douyin.resolvePlayUrl(info.aweme_id);
+  }
   if (!play || !play.url) {
     throw new Error('未获取到无水印直链');
   }
@@ -2804,6 +2810,7 @@ function enqueueDouyinItems(payload) {
         index,
         aweme_id: awemeId,
         title: item.title || '',
+        play_url: item.play_url || item.url || '',
       },
     };
 
