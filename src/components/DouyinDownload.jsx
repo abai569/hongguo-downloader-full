@@ -297,7 +297,8 @@ function DouyinDownload({ onNavigate }) {
                       )}
                     </div>
                     <span className="dy-index">{String(item.index).padStart(2, '0')}</span>
-                    <span className="dy-title">{item.title}</span>
+                    {item.episode > 0 && <span className="dy-ep">第{item.episode}集</span>}
+                    <span className="dy-title" title={item.title}>{item.title}</span>
                   </div>
                 </div>
               );

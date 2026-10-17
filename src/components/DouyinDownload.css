@@ -58,6 +58,18 @@
   min-width: 0;
 }
 
+/* 识别出的集数角标：便于确认排序是否正确 */
+.dy-ep {
+  flex-shrink: 0;
+  font-size: 10px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 4px;
+  color: #ff8fa3;
+  background: rgba(255, 77, 109, 0.14);
+  margin-right: 4px;
+}
+
 /* 解析状态直接跟在按钮右侧，不单独占一行 */
 .dy-inline-status {
   font-size: 12px;

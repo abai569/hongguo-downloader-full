@@ -457,19 +457,39 @@ function normalizeAweme(aweme, index) {
   // 只有「数组且非空」才算图文；短剧接口的 images 是对象，不能据此判成图文
   const images = Array.isArray(aweme && aweme.images) && aweme.images.length ? aweme.images : null;
   const title = String((aweme && (aweme.desc || aweme.item_title || aweme.caption)) || '').trim();
+  const awemeId = String((aweme && (aweme.aweme_id || aweme.item_id)) || '');
+  const rawCreateTime = Number((aweme && (aweme.create_time || aweme.createTime)) || 0) || 0;
+  // 集数可能只出现在其中某个字段里（App 的「第N集 |」前缀、item_title、captcha…），
+  // 所以把所有文本字段都试一遍，别只盯 desc
+  const textFields = [aweme && aweme.item_title, aweme && aweme.desc, aweme && aweme.caption, aweme && aweme.title]
+    .filter((x) => typeof x === 'string' && x.trim());
+  const episode = textFields.map((x) => episodeFromTitle(x)).find((n) => n > 0) || 0;
   return {
-    aweme_id: String((aweme && (aweme.aweme_id || aweme.item_id)) || ''),
+    aweme_id: awemeId,
     vid: String((video && video.vid) || ''),
     index,
     title: title || `作品 ${index}`,
-    // 用于排序：接口给的是秒级时间戳
-    create_time: Number((aweme && (aweme.create_time || aweme.createTime)) || 0) || 0,
+    episode,
+    // 用于排序：接口给的是秒级时间戳；接口没给时从 aweme_id（雪花号）反推，
+    // 雪花号高 32 位就是秒级时间，实测与真实发布时间完全一致
+    create_time: rawCreateTime || createTimeFromId(awemeId),
     cover: pickCover(video, aweme),
     duration: video && video.duration ? Math.round(video.duration / 1000) : 0,
     url: images ? '' : pickVideoUrl(video),
     type: images ? 'images' : 'video',
     music: (aweme && aweme.music && aweme.music.title) || '',
   };
+}
+
+/** 从 aweme_id 反推发布秒级时间戳（雪花号高 32 位） */
+function createTimeFromId(awemeId) {
+  const digits = String(awemeId || '').replace(/\D/g, '');
+  if (!digits) return 0;
+  try {
+    return Number(BigInt(digits) >> 32n);
+  } catch (_) {
+    return 0;
+  }
 }
 
 /** 中文数字 → 整数（十二 / 二十五 / 一百零八） */
@@ -531,19 +551,52 @@ function orderItems(items, mode) {
   if (sortMode === 'original') {
     return list.map((item, i) => ({ ...item, index: i + 1 }));
   }
+  // aweme_id 是雪花号，近似随发布时间递增：接口没给 create_time 时用它当顺序
+  const idOf = (item) => {
+    const digits = String((item && item.aweme_id) || '').replace(/\D/g, '');
+    if (!digits) return null;
+    try { return BigInt(digits); } catch (_) { return null; }
+  };
   const rows = list.map((item) => ({
     item,
-    ep: episodeFromTitle(item && item.title),
+    ep: Number(item && item.episode) || episodeFromTitle(item && item.title),
     ct: Number(item && item.create_time) || 0,
+    id: idOf(item),
   }));
-  const byTime = (a, b) => a.ct - b.ct;
+  const cmpId = (a, b) => {
+    if (!a.id || !b.id) return 0;
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  };
+  // 发布时间优先；任一条缺时间就用 id 兜底
+  const byTime = (a, b) => {
+    if (a.ct > 0 && b.ct > 0) {
+      if (a.ct !== b.ct) return a.ct - b.ct;
+      return cmpId(a, b);
+    }
+    return cmpId(a, b);
+  };
   if (sortMode === 'episode') {
+    if (!rows.some((r) => r.ep > 0)) {
+      return list.map((item, i) => ({ ...item, index: i + 1, episode: 0 }));
+    }
     rows.sort((a, b) => (a.ep || 999999) - (b.ep || 999999) || byTime(a, b));
   } else if (sortMode === 'time-desc') {
-    rows.sort((a, b) => b.ct - a.ct);
+    rows.sort((a, b) => {
+      if (a.ct > 0 && b.ct > 0 && a.ct !== b.ct) return b.ct - a.ct;
+      return -cmpId(a, b);
+    });
   } else if (sortMode === 'time-asc') {
     rows.sort(byTime);
   } else {
+    // 关键：只有「大部分作品都能识别出集数」时才按集数重排。
+    // 抖音合集里往往只有零星几条标题带「第N集」，接口顺序本身才是 App 里
+    // 「第1集/第2集…」的顺序，硬按集数排反而会把其余条目打乱。
+    const withEp = rows.filter((r) => r.ep > 0).length;
+    const enough = rows.length > 0 && withEp / rows.length >= 0.6;
+    if (!enough) {
+      log('[order] 可识别集数 ' + withEp + '/' + rows.length + '，保持接口原始顺序');
+      return list.map((item, i) => ({ ...item, index: i + 1, episode: Number(item.episode) || 0 }));
+    }
     rows.sort((a, b) => {
       const aHas = a.ep > 0 ? 0 : 1;
       const bHas = b.ep > 0 ? 0 : 1;
