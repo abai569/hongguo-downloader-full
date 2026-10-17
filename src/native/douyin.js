@@ -69,6 +69,28 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** 带超时的 promise：CDP 命令偶发不返回，绝不能让整条链路卡死 */
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(label + ' 超时（' + ms + 'ms）')), ms)),
+  ]);
+}
+
+// 同一时刻只保留一个抓包窗口；重复解析时先干掉上一个，避免僵尸窗口堆积
+let inflightWindow = null;
+
+function closeInflightWindow() {
+  if (!inflightWindow) return;
+  try {
+    if (!inflightWindow.isDestroyed()) {
+      log('[capture] 关闭上一次的解析窗口');
+      inflightWindow.destroy();
+    }
+  } catch (_) {}
+  inflightWindow = null;
+}
+
 function sanitizeName(name) {
   return String(name || '')
     .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '')
@@ -216,6 +238,7 @@ async function followHttp(url) {
 /** 最后兜底：用隐藏窗口真实打开一次，让浏览器自己走完跳转 */
 async function resolveViaWindow(url, showWindow) {
   const { BrowserWindow } = require('electron');
+  closeInflightWindow();
   const win = new BrowserWindow({
     width: 1120,
     height: 820,
@@ -226,14 +249,21 @@ async function resolveViaWindow(url, showWindow) {
       contextIsolation: true,
       nodeIntegration: false,
       partition: 'persist:douyin-parse',
+      backgroundThrottling: false,
     },
   });
+  inflightWindow = win;
 
   try {
     win.webContents.setUserAgent(UA);
     win.webContents.on('did-fail-load', (_e, code, desc, failedUrl) =>
       log('[target] 窗口 did-fail-load', code, desc, urlPath(failedUrl)));
-    await win.loadURL(url, { userAgent: UA });
+    // loadURL 也可能不返回，10 秒兜底，拿不到就按"无法识别"处理
+    try {
+      await withTimeout(win.loadURL(url, { userAgent: UA }), 10000, '窗口加载');
+    } catch (error) {
+      log('[target] 窗口加载失败:', error.message);
+    }
     await delay(2500);
 
     const finalUrl = win.webContents.getURL();
@@ -266,6 +296,7 @@ async function resolveViaWindow(url, showWindow) {
     try {
       if (!win.isDestroyed()) win.destroy();
     } catch (_) {}
+    if (inflightWindow === win) inflightWindow = null;
   }
 }
 
@@ -483,6 +514,8 @@ async function capturePage(pageUrlOrId, options) {
   const pageUrl = /^https?:\/\//i.test(raw) ? raw : `https://www.douyin.com/collection/${raw}`;
   const t0 = Date.now();
 
+  closeInflightWindow();
+
   const win = new BrowserWindow({
     width: 1120,
     height: 820,
@@ -498,6 +531,7 @@ async function capturePage(pageUrlOrId, options) {
       backgroundThrottling: false,
     },
   });
+  inflightWindow = win;
 
   const state = { pages: [], hasMore: true, bodies: 0, seen: 0, media: [], name: '', xhrs: 0 };
   let attached = false;
@@ -609,7 +643,12 @@ async function capturePage(pageUrlOrId, options) {
           log('[capture] body-fail', urlPath(url), error.message);
         }
       });
-      await debuggerApi.sendCommand('Network.enable');
+      // 关键：不 await Network.enable。
+      // 以往这里一卡住，后面连 loadURL 都执行不到（日志停在 CDP attached），
+      // 表现为界面永远"正在打开抖音页面"。现在先导航，enable 用超时兜住。
+      withTimeout(debuggerApi.sendCommand('Network.enable'), 3000, 'Network.enable')
+        .then(() => log('[capture] Network.enable 完成'))
+        .catch((error) => log('[capture] Network.enable 异常:', error.message));
     } catch (error) {
       log('[capture] CDP 不可用:', error.message);
       console.warn('[Douyin] CDP 不可用，改用 DOM 抓取:', error.message);
@@ -617,7 +656,10 @@ async function capturePage(pageUrlOrId, options) {
 
     // 不再等整页 load 完才看数据：抖音首页子资源多，整页 load 常要 2-4 秒，
     // 而接口往往 1 秒内就返回了。这里并发等待，谁先到谁先用。
-    const loadPromise = win.loadURL(pageUrl, { userAgent: UA }).catch((error) => {
+    log('[capture] 开始导航');
+    const loadPromise = win.loadURL(pageUrl, { userAgent: UA }).then(() => {
+      log('[perf] loadURL 完成 ' + (Date.now() - t0) + 'ms');
+    }).catch((error) => {
       log('[capture] loadURL 失败:', error.message);
     });
 
@@ -709,6 +751,7 @@ async function capturePage(pageUrlOrId, options) {
     try {
       if (!win.isDestroyed()) win.destroy();
     } catch (_) {}
+    if (inflightWindow === win) inflightWindow = null;
   }
 }
 
@@ -805,12 +848,20 @@ async function resolvePlayUrl(awemeId) {
 /** 兜底：打开作品页，用 CDP 抓 aweme/detail 响应 */
 async function resolveByCapture(awemeId) {
   const { BrowserWindow } = require('electron');
+  closeInflightWindow();
   const win = new BrowserWindow({
     width: 1120,
     height: 820,
     show: false,
-    webPreferences: { sandbox: false, contextIsolation: true, nodeIntegration: false },
+    webPreferences: {
+      sandbox: false,
+      contextIsolation: true,
+      nodeIntegration: false,
+      partition: 'persist:douyin-parse',
+      backgroundThrottling: false,
+    },
   });
+  inflightWindow = win;
   let attached = false;
   let result = null;
 
@@ -878,6 +929,7 @@ async function resolveByCapture(awemeId) {
     try {
       if (!win.isDestroyed()) win.destroy();
     } catch (_) {}
+    if (inflightWindow === win) inflightWindow = null;
   }
 }
 
