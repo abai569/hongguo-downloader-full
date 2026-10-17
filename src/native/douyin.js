@@ -94,6 +94,14 @@ function closeInflightWindow() {
   inflightWindow = null;
 }
 
+/** 供上层超时兜底调用：立刻结束当前抓取，别让窗口在后台空转 */
+function abortInflight(reason) {
+  if (!inflightWindow) return false;
+  log('[capture] 上层请求中止：' + (reason || '超时'));
+  closeInflightWindow();
+  return true;
+}
+
 function sanitizeName(name) {
   return String(name || '')
     .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '')
@@ -270,6 +278,7 @@ async function resolveViaWindow(url, showWindow) {
       backgroundThrottling: false,
     },
   });
+  hardenWindow(win, 'capture');
   inflightWindow = win;
 
   try {
@@ -564,6 +573,74 @@ function mergeMedia(target, found) {
   return added;
 }
 
+/** 统一的响应体处理：CDP 与页面内拦截两条通道都走这里 */
+function makeIngest(state, onProgress, notify) {
+  return (url, body, source) => {
+    if (!body || typeof body !== 'string') return;
+    let json = null;
+    try {
+      json = JSON.parse(body);
+    } catch (_) {
+      return;
+    }
+    state.bodies += 1;
+    nameFromJson(json, state);
+
+    if (Array.isArray(json.aweme_list) && json.aweme_list.length) {
+      state.pages.push(json);
+      if (json.has_more === false) state.hasMore = false;
+      log(
+        '[capture] 列表页#' + state.pages.length,
+        'list=' + json.aweme_list.length,
+        'total=' + countItems(state.pages),
+        'has_more=' + json.has_more,
+        'cursor=' + json.cursor,
+        'via=' + source
+      );
+      onProgress({ stage: 'page', pages: state.pages.length, found: countItems(state.pages) });
+    }
+
+    const found = [];
+    deepCollectMedia(json, found, 0, '');
+    if (found.length) {
+      const added = mergeMedia(state.media, found);
+      log(
+        '[capture] 媒体节点',
+        urlPath(url),
+        'found=' + found.length,
+        'new=' + added,
+        'total=' + state.media.length,
+        'via=' + source
+      );
+      onProgress({ stage: 'page', pages: state.bodies, found: state.media.length });
+    }
+
+    if (hasCapture(state)) notify();
+  };
+}
+
+const HOOK_PRELOAD = path.join(__dirname, 'douyin-hook.js');
+
+/**
+ * 解析/登录窗口的统一加固：
+ * 禁止弹新窗口，禁止跳到 http(s) 之外的协议（抖音页面里有 bitbrowser:// 之类的
+ * 自定义协议，会触发 Windows 的"选择打开方式"弹窗，直接卡住用户）。
+ */
+function hardenWindow(win, label) {
+  try {
+    win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  } catch (_) {}
+  const blockNonHttp = (event, targetUrl) => {
+    if (!targetUrl || /^https?:/i.test(targetUrl) || /^(about|data|blob|devtools):/i.test(targetUrl)) return;
+    try { event.preventDefault(); } catch (_) {}
+    log('[' + label + '] 已拦截协议跳转 ' + String(targetUrl).slice(0, 60));
+  };
+  try {
+    win.webContents.on('will-navigate', blockNonHttp);
+    win.webContents.on('will-redirect', blockNonHttp);
+  } catch (_) {}
+}
+
 /**
  * 在隐藏窗口里打开页面，用 CDP 抓页面自己发出的签名请求。
  * 合集页命中 mix/aweme 拿列表；短剧页结构不同，靠 deepCollectMedia 从任意接口里捞视频。
@@ -585,19 +662,23 @@ async function capturePage(pageUrlOrId, options) {
     show: !!showWindow,
     title: '抖音合集解析',
     webPreferences: {
-      sandbox: false,
-      contextIsolation: true,
+      // 沙箱 preload + 关闭隔离：能在页面世界拦截 fetch/XHR，但页面拿不到 Node 能力
+      sandbox: true,
+      contextIsolation: false,
       nodeIntegration: false,
+      preload: HOOK_PRELOAD,
       // 固定分区：cookie 与静态资源缓存跨次解析复用，第二次起明显更快
       partition: 'persist:douyin-parse',
       // 隐藏窗口默认会被节流（定时器/渲染降速），抖音这类 SPA 会因此迟迟不发请求
       backgroundThrottling: false,
     },
   });
+  hardenWindow(win, 'capture');
   inflightWindow = win;
 
   const state = { pages: [], hasMore: true, bodies: 0, seen: 0, media: [], name: '', xhrs: 0 };
   let attached = false;
+  let polling = true;
 
   // 事件驱动的"首批数据到达"等待：轮询会有 400ms 抖动，这里一有数据立刻醒
   let wake = null;
@@ -636,72 +717,63 @@ async function capturePage(pageUrlOrId, options) {
     win.webContents.on('render-process-gone', (_e, details) =>
       log('[capture] render-process-gone', JSON.stringify(details || {})));
 
+    const ingest = makeIngest(state, onProgress, notify);
+
+    // ===== 通道 1：页面内拦截（preload 注入），最稳定 =====
+    const pollHook = async () => {
+      while (polling) {
+        try {
+          const items = await win.webContents.executeJavaScript(
+            '(() => { const a = window.__dyData || []; window.__dyData = []; return a; })()',
+            true
+          );
+          if (Array.isArray(items) && items.length) {
+            for (const item of items) ingest(item.url, item.body, 'hook');
+          }
+        } catch (_) {}
+        await delay(400);
+      }
+    };
+
+    // ===== 通道 2：CDP（仅日志 + 兜底；body 必须等 loadingFinished） =====
     const debuggerApi = win.webContents.debugger;
     try {
       debuggerApi.attach('1.3');
       attached = true;
       log('[capture] CDP attached');
+      const pending = new Map();
       debuggerApi.on('message', async (_event, method, params) => {
-        if (method !== 'Network.responseReceived') return;
-        const url = params && params.response && params.response.url;
-        if (!url) return;
-        const status = params.response.status;
-        const generic = GENERIC_API.test(url);
-
-        // 记录页面发出的所有 XHR/Fetch：若一条都没有，说明页面根本没跑起来（节流/风控）
-        const kind = params.type;
-        if ((kind === 'XHR' || kind === 'Fetch') && state.xhrs < 60) {
-          state.xhrs += 1;
-          log('[capture] xhr', status, kind, urlPath(url));
-        }
-
-        // 把页面实际发出的接口都记下来：
-        // 接口一旦改名，这里能直接看出应该匹配什么路径
-        if (generic) {
-          if (state.seen < 80) {
+        if (method === 'Network.responseReceived') {
+          const url = params && params.response && params.response.url;
+          if (!url) return;
+          const status = params.response.status;
+          const kind = params.type;
+          if ((kind === 'XHR' || kind === 'Fetch') && state.xhrs < 60) {
+            state.xhrs += 1;
+            log('[capture] xhr', status, kind, urlPath(url));
+          }
+          if (GENERIC_API.test(url) && state.seen < 80) {
             state.seen += 1;
             log('[capture] resp', status, urlPath(url));
           }
+          if (PAGE_API.test(url) || GENERIC_API.test(url)) pending.set(params.requestId, url);
+          return;
         }
-
-        if (!PAGE_API.test(url) && !generic) return;
+        if (method === 'Network.loadingFailed') {
+          pending.delete(params.requestId);
+          return;
+        }
+        if (method !== 'Network.loadingFinished') return;
+        const url = pending.get(params.requestId);
+        if (!url) return;
+        pending.delete(params.requestId);
         try {
-          const { body } = await debuggerApi.sendCommand('Network.getResponseBody', {
-            requestId: params.requestId,
-          });
-          const json = JSON.parse(body);
-          state.bodies += 1;
-          nameFromJson(json, state);
-
-          if (Array.isArray(json.aweme_list) && json.aweme_list.length) {
-            state.pages.push(json);
-            if (json.has_more === false) state.hasMore = false;
-            log(
-              '[capture] 列表页#' + state.pages.length,
-              'list=' + json.aweme_list.length,
-              'total=' + countItems(state.pages),
-              'has_more=' + json.has_more,
-              'cursor=' + json.cursor
-            );
-            onProgress({ stage: 'page', pages: state.pages.length, found: countItems(state.pages) });
-          }
-
-          // 不论什么接口，都顺手扫一遍视频节点：短剧页不走 aweme_list
-          const found = [];
-          deepCollectMedia(json, found, 0, '');
-          if (found.length) {
-            const added = mergeMedia(state.media, found);
-            log(
-              '[capture] 媒体节点',
-              urlPath(url),
-              'found=' + found.length,
-              'new=' + added,
-              'total=' + state.media.length,
-              'trail=' + found[0].trail
-            );
-            onProgress({ stage: 'page', pages: state.bodies, found: state.media.length });
-          }
-          if (hasCapture(state)) notify();
+          const { body } = await withTimeout(
+            debuggerApi.sendCommand('Network.getResponseBody', { requestId: params.requestId }),
+            4000,
+            'getResponseBody'
+          );
+          ingest(url, body, 'cdp');
         } catch (error) {
           log('[capture] body-fail', urlPath(url), error.message);
         }
@@ -714,7 +786,7 @@ async function capturePage(pageUrlOrId, options) {
         .catch((error) => log('[capture] Network.enable 异常:', error.message));
     } catch (error) {
       log('[capture] CDP 不可用:', error.message);
-      console.warn('[Douyin] CDP 不可用，改用 DOM 抓取:', error.message);
+      console.warn('[Douyin] CDP 不可用，改用页面内拦截:', error.message);
     }
 
     // 不再等整页 load 完才看数据：抖音首页子资源多，整页 load 常要 2-4 秒，
@@ -725,6 +797,7 @@ async function capturePage(pageUrlOrId, options) {
     }).catch((error) => {
       log('[capture] loadURL 失败:', error.message);
     });
+    pollHook();
 
     const gotFirst = await waitCapture(FIRST_PAGE_TIMEOUT_MS);
     log('[perf] 首批数据 ' + (Date.now() - t0) + 'ms got=' + gotFirst + ' xhr=' + state.xhrs);
@@ -766,10 +839,23 @@ async function capturePage(pageUrlOrId, options) {
     } else {
       let lastCount = -1;
       let stable = 0;
+      let emptyRounds = 0;
       for (let i = 0; i < MAX_SCROLLS; i++) {
+        // 兜底预算：整段抓取不超过 40 秒，避免界面已经超时了窗口还在滚
+        if (Date.now() - t0 > 40000) {
+          log('[capture] 抓取超过 40 秒，提前结束');
+          break;
+        }
         const count = mediaCount(state);
         if (count === lastCount) stable += 1;
         else stable = 0;
+        if (!hasCapture(state)) {
+          emptyRounds += 1;
+          if (emptyRounds >= 5) {
+            log('[capture] 连续 5 轮没有任何数据，停止滚动');
+            break;
+          }
+        }
         if (hasCapture(state) && (!state.hasMore || stable >= 2)) break;
         lastCount = count;
         try {
@@ -830,6 +916,7 @@ async function capturePage(pageUrlOrId, options) {
 
     return { pages: state.pages, domIds: [], media: state.media, mixName, author, pageTitle, detectedName: state.name };
   } finally {
+    polling = false;
     try {
       if (attached) win.webContents.debugger.detach();
     } catch (_) {}
@@ -951,7 +1038,7 @@ async function resolvePlayUrl(awemeId) {
   return resolveByCapture(id);
 }
 
-/** 兜底：打开作品页，用 CDP 抓 aweme/detail 响应 */
+/** 兜底：打开作品页，用页面内拦截（辅以 CDP）抓 aweme/detail 响应 */
 async function resolveByCapture(awemeId) {
   const { BrowserWindow } = require('electron');
   closeInflightWindow();
@@ -960,15 +1047,18 @@ async function resolveByCapture(awemeId) {
     height: 820,
     show: false,
     webPreferences: {
-      sandbox: false,
-      contextIsolation: true,
+      sandbox: true,
+      contextIsolation: false,
       nodeIntegration: false,
+      preload: HOOK_PRELOAD,
       partition: 'persist:douyin-parse',
       backgroundThrottling: false,
     },
   });
+  hardenWindow(win, 'capture');
   inflightWindow = win;
   let attached = false;
+  let polling = true;
   let result = null;
   const state = { xhrs: 0 };
 
@@ -1026,11 +1116,66 @@ async function resolveByCapture(awemeId) {
       .then(() => log('[detail] Network.enable 完成'))
       .catch((error) => log('[detail] Network.enable 异常:', error.message));
 
+    // 页面内拦截通道：CDP 取 body 在抖音大页面上几乎必失败，这里才是主通道
+    const consumeHookBody = (url, body) => {
+      if (result || !body) return;
+      let json = null;
+      try { json = JSON.parse(body); } catch (_) { return; }
+      const list = json.aweme_list || json.aweme_details || (json.aweme_detail ? [json.aweme_detail] : []);
+      const item = Array.isArray(list) ? list[0] : null;
+      if (item) {
+        const playUrl = pickVideoUrl(item.video || {});
+        if (playUrl) {
+          result = {
+            url: playUrl,
+            referer: REFERER,
+            title: String(item.desc || '').trim(),
+            cover: pickCover(item.video || {}, item),
+            duration: item.video && item.video.duration ? Math.round(item.video.duration / 1000) : 0,
+            type: 'video',
+            mix: mixFromAweme(item),
+          };
+          log('[detail] hook 命中 ' + urlPath(url) + (result.mix ? ' 归属合集 ' + result.mix.mix_id : ''));
+          return;
+        }
+      }
+      const found = [];
+      deepCollectMedia(json, found, 0, '');
+      if (found.length) {
+        result = {
+          url: found[0].url,
+          referer: REFERER,
+          title: found[0].title || '',
+          cover: found[0].cover || '',
+          duration: found[0].duration || 0,
+          type: 'video',
+          mix: findMixInTree(json),
+        };
+        log('[detail] hook 通用扫描命中 ' + urlPath(url) + ' trail=' + found[0].trail);
+      }
+    };
+
+    const pollHook = async () => {
+      while (polling && !result) {
+        try {
+          const items = await win.webContents.executeJavaScript(
+            '(() => { const a = window.__dyData || []; window.__dyData = []; return a; })()',
+            true
+          );
+          if (Array.isArray(items)) {
+            for (const item of items) consumeHookBody(item.url, item.body);
+          }
+        } catch (_) {}
+        await delay(400);
+      }
+    };
+
     // 分享页轻、Web 页稳：依次尝试，谁先出结果用谁
     const entries = [
       `https://www.iesdouyin.com/share/video/${awemeId}/`,
       `https://www.douyin.com/video/${awemeId}`,
     ];
+    pollHook();
     for (let i = 0; i < entries.length; i++) {
       if (result) break;
       const entry = entries[i];
@@ -1051,6 +1196,7 @@ async function resolveByCapture(awemeId) {
     if (!result) throw new Error('未获取到无水印直链（可能触发风控，可在设置里打开「解析合集时显示窗口」后重试）');
     return result;
   } finally {
+    polling = false;
     try {
       if (attached) win.webContents.debugger.detach();
     } catch (_) {}
@@ -1236,7 +1382,7 @@ async function loginStatus() {
 /** 打开可见的抖音窗口让用户扫码登录；登录态由持久分区保存 */
 async function openLoginWindow() {
   const { BrowserWindow } = require('electron');
-  closeInflightWindow();
+  // 登录窗口独立使用，不登记为 inflightWindow：否则解析一开始就会把它关掉
   const win = new BrowserWindow({
     width: 1200,
     height: 900,
@@ -1250,11 +1396,8 @@ async function openLoginWindow() {
       backgroundThrottling: false,
     },
   });
-  inflightWindow = win;
-  win.on('closed', () => {
-    if (inflightWindow === win) inflightWindow = null;
-    log('[login] 登录窗口已关闭');
-  });
+  win.on('closed', () => log('[login] 登录窗口已关闭'));
+  hardenWindow(win, 'login');
   win.webContents.setUserAgent(UA);
   win.loadURL('https://www.douyin.com/', { userAgent: UA })
     .then(() => log('[login] 登录页已加载'))
@@ -1434,6 +1577,7 @@ module.exports = {
   playUrlFromVid,
   loginStatus,
   openLoginWindow,
+  abortInflight,
   resolveCollection,
   resolvePlayUrl,
   resolveCollectionTarget,

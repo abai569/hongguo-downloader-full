@@ -2741,7 +2741,11 @@ ipcMain.handle('douyin-resolve-collection', async (event, input) => {
     const settings = getCurrentSettings();
     // 整体兜底超时：解析链内部各段都有超时，这里再兜一层，避免界面无限"解析中"
     const timeout = new Promise((_, reject) => {
-      setTimeout(() => reject(new Error('解析超时（超过 45 秒），请查看解析日志')), 45000);
+      setTimeout(() => {
+        // 超时后要真的把抓取停掉，否则窗口会在后台继续滚（此前出现过 103 秒空转）
+        try { douyin.abortInflight('IPC 超时 45s'); } catch (_) {}
+        reject(new Error('解析超时（超过 45 秒），请查看解析日志'));
+      }, 45000);
     });
     const data = await Promise.race([
       douyin.resolveCollection(input, {
