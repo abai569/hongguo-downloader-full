@@ -220,7 +220,7 @@ function SettingsPage() {
             </span>
           </label>
           <p className="settings-hint">
-            合集解析会在后台打开抖音页面滚动加载，通常 3–15 秒；保存后立即生效。
+            合集解析会在后台打开抖音页面并抓取接口，通常 3–8 秒；缓存与 Cookie 会跨次复用。保存后立即生效。
           </p>
           <div className="proxy-status-row">
             <button

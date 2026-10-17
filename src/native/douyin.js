@@ -18,7 +18,7 @@ const PAGE_API = /\/aweme\/v1\/web\/(mix\/aweme|aweme\/post|collection)/;
 const DETAIL_API = /\/aweme\/v1\/web\/(aweme\/detail|mix\/aweme)/;
 
 const FIRST_PAGE_TIMEOUT_MS = 20000;
-const SCROLL_WAIT_MS = 1600;
+const SCROLL_WAIT_MS = 1100;
 const MAX_SCROLLS = 80;
 const LOG_MAX_BYTES = 2 * 1024 * 1024;
 
@@ -196,7 +196,12 @@ async function resolveViaWindow(url, showWindow) {
     height: 820,
     show: !!showWindow,
     title: '抖音链接解析',
-    webPreferences: { sandbox: false, contextIsolation: true, nodeIntegration: false },
+    webPreferences: {
+      sandbox: false,
+      contextIsolation: true,
+      nodeIntegration: false,
+      partition: 'persist:douyin-parse',
+    },
   });
 
   try {
@@ -400,22 +405,56 @@ function mergeMedia(target, found) {
 async function capturePage(pageUrlOrId, options) {
   const { BrowserWindow } = require('electron');
   const showWindow = options && options.showWindow;
+  const paged = options && options.paged !== false;
   const onProgress = (options && options.onProgress) || (() => {});
   const raw = String(pageUrlOrId || '');
   const pageUrl = /^https?:\/\//i.test(raw) ? raw : `https://www.douyin.com/collection/${raw}`;
+  const t0 = Date.now();
 
   const win = new BrowserWindow({
     width: 1120,
     height: 820,
     show: !!showWindow,
     title: '抖音合集解析',
-    webPreferences: { sandbox: false, contextIsolation: true, nodeIntegration: false },
+    webPreferences: {
+      sandbox: false,
+      contextIsolation: true,
+      nodeIntegration: false,
+      // 固定分区：cookie 与静态资源缓存跨次解析复用，第二次起明显更快
+      partition: 'persist:douyin-parse',
+    },
   });
 
   const state = { pages: [], hasMore: true, bodies: 0, seen: 0, media: [] };
   let attached = false;
 
-  log('[capture] open', pageUrl, 'showWindow=' + !!showWindow);
+  // 事件驱动的"首批数据到达"等待：轮询会有 400ms 抖动，这里一有数据立刻醒
+  let wake = null;
+  const notify = () => {
+    if (wake) {
+      const resolve = wake;
+      wake = null;
+      resolve();
+    }
+  };
+  const waitCapture = (ms) => new Promise((resolve) => {
+    if (hasCapture(state)) return resolve(true);
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      wake = null;
+      resolve(false);
+    }, ms);
+    wake = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(true);
+    };
+  });
+
+  log('[capture] open', pageUrl, 'showWindow=' + !!showWindow + ' paged=' + paged);
 
   try {
     win.webContents.setUserAgent(UA);
@@ -482,6 +521,7 @@ async function capturePage(pageUrlOrId, options) {
             );
             onProgress({ stage: 'page', pages: state.bodies, found: state.media.length });
           }
+          if (hasCapture(state)) notify();
         } catch (error) {
           log('[capture] body-fail', urlPath(url), error.message);
         }
@@ -492,43 +532,57 @@ async function capturePage(pageUrlOrId, options) {
       console.warn('[Douyin] CDP 不可用，改用 DOM 抓取:', error.message);
     }
 
-    await win.loadURL(pageUrl, { userAgent: UA });
+    // 不再等整页 load 完才看数据：抖音首页子资源多，整页 load 常要 2-4 秒，
+    // 而接口往往 1 秒内就返回了。这里并发等待，谁先到谁先用。
+    const loadPromise = win.loadURL(pageUrl, { userAgent: UA }).catch((error) => {
+      log('[capture] loadURL 失败:', error.message);
+    });
+
+    const gotFirst = await waitCapture(FIRST_PAGE_TIMEOUT_MS);
+    log('[perf] 首批数据 ' + (Date.now() - t0) + 'ms got=' + gotFirst);
+
+    // 滚动需要 DOM 就绪，但最多再等 6 秒，不能无限等
+    await Promise.race([loadPromise, delay(6000)]);
+    log('[perf] 页面就绪 ' + (Date.now() - t0) + 'ms');
     try {
-      const title = await win.webContents.getTitle();
-      log('[capture] title=' + JSON.stringify(title || ''));
+      log('[capture] title=' + JSON.stringify((await win.webContents.getTitle()) || ''));
     } catch (_) {}
 
-    const startedAt = Date.now();
-    while (Date.now() - startedAt < FIRST_PAGE_TIMEOUT_MS && !hasCapture(state)) {
-      await delay(400);
-    }
     if (!hasCapture(state)) {
-      log('[capture] 首屏超时，未捕获到任何作品（waitMs=' + (Date.now() - startedAt) + '）');
+      log('[capture] 首屏超时，未捕获到任何作品');
     }
 
-    let lastCount = -1;
-    let stable = 0;
-    for (let i = 0; i < MAX_SCROLLS; i++) {
-      const count = mediaCount(state);
-      if (count === lastCount) stable += 1;
-      else stable = 0;
-      if (hasCapture(state) && (!state.hasMore || stable >= 3)) break;
-      lastCount = count;
-      try {
-        await win.webContents.executeJavaScript(
-          'window.scrollTo(0, document.body.scrollHeight); document.body.scrollHeight;',
-          true
-        );
-      } catch (_) {}
-      await delay(SCROLL_WAIT_MS);
+    if (!paged) {
+      // 短剧页一次就把全集返回，没有分页，滚动纯属浪费：
+      // 只留一小段静默期，等并行发出的其它接口落地即可
+      await delay(700);
       onProgress({ stage: 'scroll', pages: state.bodies, found: mediaCount(state) });
+    } else {
+      let lastCount = -1;
+      let stable = 0;
+      for (let i = 0; i < MAX_SCROLLS; i++) {
+        const count = mediaCount(state);
+        if (count === lastCount) stable += 1;
+        else stable = 0;
+        if (hasCapture(state) && (!state.hasMore || stable >= 2)) break;
+        lastCount = count;
+        try {
+          await win.webContents.executeJavaScript(
+            'window.scrollTo(0, document.body.scrollHeight); document.body.scrollHeight;',
+            true
+          );
+        } catch (_) {}
+        await delay(SCROLL_WAIT_MS);
+        onProgress({ stage: 'scroll', pages: state.bodies, found: mediaCount(state) });
+      }
     }
     log(
-      '[capture] scroll 结束 total=' + mediaCount(state) +
+      '[capture] 抓取结束 total=' + mediaCount(state) +
       ' pages=' + state.pages.length +
       ' bodies=' + state.bodies +
       ' hasMore=' + state.hasMore
     );
+    log('[perf] 抓取结束 ' + (Date.now() - t0) + 'ms');
 
     let mixName = '';
     let author = '';
@@ -805,6 +859,11 @@ function collectionResult(mixId, mixName, author, items, extra = {}) {
  */
 async function resolveCollection(input, options = {}) {
   resetLogIfLarge();
+  const tStart = Date.now();
+  const finish = (result) => {
+    log('[perf] 解析总耗时 ' + (Date.now() - tStart) + 'ms');
+    return result;
+  };
   log('===== 开始解析 =====');
   log('[input]', JSON.stringify(String(input || '').slice(0, 200)));
 
@@ -813,9 +872,10 @@ async function resolveCollection(input, options = {}) {
   log('[target] kind=' + target.kind + ' id=' + target.id);
   onProgress({ stage: 'opening', pages: 0, found: 0 });
 
-  const readPage = async (pageUrl, keyId, hintName) => {
+  const readPage = async (pageUrl, keyId, hintName, paged) => {
     const captured = await capturePage(pageUrl, {
       showWindow: options.showWindow,
+      paged,
       onProgress,
     });
     const items = await itemsFromCapture(captured, onProgress);
@@ -836,18 +896,19 @@ async function resolveCollection(input, options = {}) {
   };
 
   if (target.kind === 'collection') {
-    return readPage(`https://www.douyin.com/collection/${target.id}`, target.id);
+    return finish(await readPage(`https://www.douyin.com/collection/${target.id}`, target.id, '', true));
   }
 
   if (target.kind === 'playlet') {
-    return readPage(`https://www.iesdouyin.com/share/playlet/detail/${target.id}/`, target.id);
+    // 短剧页无分页，跳过滚动
+    return finish(await readPage(`https://www.iesdouyin.com/share/playlet/detail/${target.id}/`, target.id, '', false));
   }
 
   // 单条作品：先取详情，若属于合集则顺势解析整部
   const info = await resolvePlayUrl(target.id);
   if (info.mix && info.mix.mix_id) {
     log('[result] 作品属于合集 ' + info.mix.mix_id + ' 「' + (info.mix.mix_name || '') + '」，改为解析整部');
-    return readPage(`https://www.douyin.com/collection/${info.mix.mix_id}`, info.mix.mix_id, info.mix.mix_name);
+    return finish(await readPage(`https://www.douyin.com/collection/${info.mix.mix_id}`, info.mix.mix_id, info.mix.mix_name, true));
   }
 
   log('[result] 单作品（无归属合集）');
@@ -863,7 +924,7 @@ async function resolveCollection(input, options = {}) {
     music: '',
     play_url: info.url || '',
   };
-  return collectionResult(target.id, title, '', [item], { single: true });
+  return finish(collectionResult(target.id, title, '', [item], { single: true }));
 }
 
 module.exports = {

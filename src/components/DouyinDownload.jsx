@@ -148,7 +148,7 @@ function DouyinDownload({ onNavigate }) {
           }}
         />
         <div className="dy-input-actions">
-          <span className="dy-hint">解析过程需要打开隐藏窗口滚动加载，通常 3–15 秒</span>
+          <span className="dy-hint">解析需要后台渲染页面，通常 3–8 秒；同一作者/合集再次解析会更快</span>
           <button className="btn btn-primary" onClick={handleResolve} disabled={loading}>
             {loading ? (
               <>
