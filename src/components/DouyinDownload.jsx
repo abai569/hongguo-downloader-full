@@ -151,7 +151,7 @@ function DouyinDownload({ onNavigate }) {
           }}
         />
         <div className="dy-input-actions">
-          <span className="dy-hint">短剧约 1–3 秒（纯接口）；合集需渲染页面，约 3–8 秒</span>
+          <span className="dy-hint">支持：短剧/合集/单条作品/用户主页/我的收藏（收藏需先登录）；短剧约 1–3 秒，其余需渲染页面 3–10 秒</span>
           <div className="dy-actions-right">
             <button
               className="btn btn-outline btn-sm"

@@ -49,6 +49,15 @@ function SettingsPage() {
   const [testResult, setTestResult] = useState(null);
   const [testing, setTesting] = useState(false);
   const [logPath, setLogPath] = useState('');
+  const [login, setLogin] = useState(null);
+
+  const refreshLogin = async () => {
+    if (!window.electronAPI.douyinLoginStatus) return;
+    try {
+      const res = await window.electronAPI.douyinLoginStatus();
+      setLogin(res || null);
+    } catch (_) {}
+  };
 
   useEffect(() => {
     window.electronAPI.getSettings().then(setSettings);
@@ -57,6 +66,7 @@ function SettingsPage() {
         .then((res) => { if (res && res.success) setLogPath(res.path); })
         .catch(() => {});
     }
+    refreshLogin();
   }, []);
 
   const update = (key, value) => {
@@ -242,6 +252,26 @@ function SettingsPage() {
             </button>
           </div>
           {logPath && <p className="settings-hint">日志文件：<code>{logPath}</code></p>}
+
+          <div className="proxy-status-row">
+            <span className={`proxy-dot ${login && login.loggedIn ? 'proxy-dot-on' : 'proxy-dot-off'}`} />
+            <span className="proxy-status-text">
+              {login && login.loggedIn
+                ? <>已登录{login.nickname ? `：${login.nickname}` : ''}（收藏 / 喜欢可用）</>
+                : '未登录（收藏 / 喜欢需要先登录）'}
+            </span>
+            <button
+              className="btn btn-outline btn-sm"
+              onClick={() => window.electronAPI.douyinOpenLogin()}
+              title="打开抖音网页扫码登录，登录状态会保存在独立分区里，长期有效"
+            >
+              打开登录窗口
+            </button>
+            <button className="btn btn-outline btn-sm" onClick={refreshLogin}>
+              <RefreshCw size={14} />
+              刷新状态
+            </button>
+          </div>
         </div>
 
         <div className="settings-group">

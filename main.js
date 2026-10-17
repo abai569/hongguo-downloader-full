@@ -948,18 +948,37 @@ async function downloadDouyinVideo(task, attempt) {
   const source = CancelToken.source();
   task.cancelSource = source;
 
-  const response = await axios({
-    method: 'GET',
-    url: play.url,
-    responseType: 'stream',
-    headers: {
-      'User-Agent': douyin.UA,
-      Referer: play.referer || douyin.REFERER,
-    },
-    timeout: 60000,
-    maxRedirects: 5,
-    cancelToken: source.token,
-  });
+  // 直链对 Referer 敏感：403 时换一套请求头重试，别让整集直接失败
+  const headerVariants = [
+    { 'User-Agent': douyin.UA, Referer: play.referer || douyin.REFERER },
+    { 'User-Agent': douyin.UA, Referer: douyin.PLAY_REFERER },
+    { 'User-Agent': douyin.UA },
+  ];
+  let response = null;
+  let lastRequestError = null;
+  for (let i = 0; i < headerVariants.length; i++) {
+    try {
+      response = await axios({
+        method: 'GET',
+        url: play.url,
+        responseType: 'stream',
+        headers: headerVariants[i],
+        timeout: 60000,
+        maxRedirects: 5,
+        cancelToken: source.token,
+      });
+      if (i > 0) console.log('[Douyin] 第 ' + (i + 1) + ' 套请求头成功');
+      break;
+    } catch (error) {
+      lastRequestError = error;
+      const status = error && error.response && error.response.status;
+      if (status !== 403 && status !== 401) throw error;
+      console.warn('[Douyin] 直链返回 ' + status + '，换请求头重试');
+    }
+  }
+  if (!response) {
+    throw lastRequestError || new Error('直链请求失败');
+  }
 
   const totalLength = parseInt(response.headers['content-length'], 10) || 0;
   task.totalBytes = totalLength;
@@ -2737,6 +2756,23 @@ ipcMain.handle('douyin-resolve-collection', async (event, input) => {
     douyin.log('[ipc] 解析失败：' + error.message);
     if (error && error.stack) douyin.log('[ipc] stack: ' + String(error.stack).split('\n').slice(0, 4).join(' | '));
     console.error('[Douyin] 合集解析失败:', error.message);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('douyin-login-status', async () => {
+  try {
+    const status = await douyin.loginStatus();
+    return { success: true, ...status };
+  } catch (error) {
+    return { success: false, loggedIn: false, error: error.message };
+  }
+});
+
+ipcMain.handle('douyin-open-login', async () => {
+  try {
+    return await douyin.openLoginWindow();
+  } catch (error) {
     return { success: false, error: error.message };
   }
 });

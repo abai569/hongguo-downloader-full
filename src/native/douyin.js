@@ -13,11 +13,14 @@ const path = require('path');
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const MOBILE_UA = 'Mozilla/5.0 (Linux; Android 9; SM-N9860) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.152 Mobile Safari/537.36';
 const REFERER = 'https://www.douyin.com/';
+const PLAY_REFERER = 'https://www.iesdouyin.com/';
 
-const PAGE_API = /\/aweme\/v1\/web\/(mix\/aweme|aweme\/post|collection)/;
+const PAGE_API = /\/aweme\/v1\/web\/(mix\/aweme|aweme\/post|collection|aweme\/listcollection)/;
 const DETAIL_API = /\/aweme\/v1\/web\/(aweme\/detail|mix\/aweme)/;
+const LOGIN_COOKIE_NAMES = ['sessionid', 'sessionid_ss', 'sid_tt'];
 
 const FIRST_PAGE_TIMEOUT_MS = 12000;
+const DETAIL_WAIT_MS = 9000;
 const SCROLL_WAIT_MS = 1100;
 const MAX_SCROLLS = 80;
 const LOG_MAX_BYTES = 2 * 1024 * 1024;
@@ -141,6 +144,19 @@ function extractUrl(text) {
 function idFromAnyText(text) {
   if (!text) return null;
   const source = String(text);
+
+  // 我的收藏 / 喜欢（需登录），必须放在用户主页之前判断
+  if (/showTab=(collection|favorite|like)/i.test(source) || /\/user\/self/i.test(source)) {
+    if (/showTab=(collection)/i.test(source)) return { kind: 'favorites', id: 'collection' };
+    if (/showTab=(favorite|like)/i.test(source)) return { kind: 'favorites', id: 'favorite' };
+    if (/\/user\/self/i.test(source)) return { kind: 'favorites', id: 'collection' };
+  }
+
+  // 用户主页：douyin.com/user/<sec_uid>
+  const userMatch = source.match(/\/user\/([A-Za-z0-9_\-]{8,})/);
+  if (userMatch && userMatch[1] !== 'self') {
+    return { kind: 'user', id: userMatch[1] };
+  }
 
   // 抖音短剧（playlet）：分享链接最外层形态，优先识别
   const playletPatterns = [
@@ -366,6 +382,29 @@ function playUrlFromVid(vid, ratio = '1080p') {
   return `https://aweme.snssdk.com/aweme/v1/play/?video_id=${encodeURIComponent(id)}&ratio=${ratio}&line=0`;
 }
 
+/** 深扫任意 JSON 找 mix_info（单条作品自动扩成合集/短剧时用） */
+function findMixInTree(node, depth = 0) {
+  if (!node || depth > 6) return null;
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const found = findMixInTree(item, depth + 1);
+      if (found) return found;
+    }
+    return null;
+  }
+  if (typeof node !== 'object') return null;
+  const direct = mixFromAweme(node);
+  if (direct) return direct;
+  for (const key of Object.keys(node)) {
+    const value = node[key];
+    if (value && typeof value === 'object') {
+      const found = findMixInTree(value, depth + 1);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
 /** 挑选无水印直链：bit_rate 高清优先，其次 play_addr，最后 download_addr 去水印；都没有则用 vid 拼 */
 function pickVideoUrl(video) {
   const candidates = [];
@@ -462,7 +501,7 @@ function nameFromJson(node, state, depth = 0) {
   }
 }
 
-const GENERIC_API = /\/aweme\/|\/playlet\/|\/series\/|\/mix\/|\/episode\//;
+const GENERIC_API = /\/aweme\/|\/playlet\/|\/series\/|\/mix\/|\/episode\/|\/user\/|\/collection/;
 
 /**
  * 递归扫描任意 JSON，找出"能下载的视频节点"。
@@ -739,6 +778,18 @@ async function capturePage(pageUrlOrId, options) {
             true
           );
         } catch (_) {}
+        // 抖音列表多是内部滚动容器，window.scrollTo 不一定生效，补一次真实滚轮事件
+        if (attached) {
+          try {
+            await withTimeout(
+              win.webContents.debugger.sendCommand('Input.dispatchMouseEvent', {
+                type: 'mouseWheel', x: 600, y: 400, deltaX: 0, deltaY: 1500, pointerType: 'mouse',
+              }),
+              2000,
+              'wheel'
+            );
+          } catch (_) {}
+        }
         await delay(SCROLL_WAIT_MS);
         onProgress({ stage: 'scroll', pages: state.bodies, found: mediaCount(state) });
       }
@@ -757,6 +808,16 @@ async function capturePage(pageUrlOrId, options) {
       const info = page.mix_info || page.collection_info;
       if (!mixName && info && info.mix_name) mixName = info.mix_name;
       if (!author && info && info.author && info.author.nickname) author = info.author.nickname;
+    }
+    // 主页作品没有 mix_info，作者名从第一条作品的 author 上取
+    if (!author) {
+      for (const page of state.pages) {
+        const first = (page.aweme_list || [])[0];
+        if (first && first.author && first.author.nickname) {
+          author = String(first.author.nickname).trim();
+          break;
+        }
+      }
     }
 
     if (!hasCapture(state)) {
@@ -836,27 +897,48 @@ async function resolvePlayUrl(awemeId) {
     if (match) {
       const router = JSON.parse(match[1]);
       const loader = router.loaderData || {};
+      log('[detail] loaderData keys=' + Object.keys(loader).join('|').slice(0, 200));
+
       for (const key of Object.keys(loader)) {
         const res = loader[key] && loader[key].videoInfoRes;
         const itemList = res && res.item_list;
-        if (Array.isArray(itemList) && itemList.length) {
-          const item = itemList[0];
-          const url = pickVideoUrl(item.video || {});
-          log('[detail] item_list=' + itemList.length + ' playUrl=' + (url ? urlPath(url) : '空'));
-          if (url) {
-            const mix = mixFromAweme(item);
-            if (mix) log('[detail] 归属合集 ' + mix.mix_id + ' 「' + mix.mix_name + '」');
-            return {
-              url,
-              referer: REFERER,
-              title: String(item.desc || '').trim(),
-              cover: pickCover(item.video || {}, item),
-              duration: item.video && item.video.duration ? Math.round(item.video.duration / 1000) : 0,
-              type: Array.isArray(item.images) && item.images.length ? 'images' : 'video',
-              mix,
-            };
-          }
+        if (!Array.isArray(itemList) || !itemList.length) {
+          log('[detail] ' + key + ' 无 item_list');
+          continue;
         }
+        const item = itemList[0];
+        const url = pickVideoUrl(item.video || {});
+        log('[detail] item_list=' + itemList.length + ' playUrl=' + (url ? urlPath(url) : '空') + ' vid=' + ((item.video && item.video.vid) || '(无)'));
+        if (url) {
+          const mix = mixFromAweme(item);
+          if (mix) log('[detail] 归属合集 ' + mix.mix_id + ' 「' + mix.mix_name + '」');
+          return {
+            url,
+            referer: REFERER,
+            title: String(item.desc || '').trim(),
+            cover: pickCover(item.video || {}, item),
+            duration: item.video && item.video.duration ? Math.round(item.video.duration / 1000) : 0,
+            type: Array.isArray(item.images) && item.images.length ? 'images' : 'video',
+            mix,
+          };
+        }
+      }
+
+      // 结构变了也不怕：对整棵 _ROUTER_DATA 做通用媒体扫描
+      const found = [];
+      deepCollectMedia(router, found, 0, '');
+      log('[detail] _ROUTER_DATA 通用扫描节点数=' + found.length + (found[0] ? ' trail=' + found[0].trail : ''));
+      if (found.length) {
+        const best = found[0];
+        return {
+          url: best.url,
+          referer: REFERER,
+          title: best.title || '',
+          cover: best.cover || '',
+          duration: best.duration || 0,
+          type: 'video',
+          mix: findMixInTree(router),
+        };
       }
       log('[detail] 遍历 loaderData 未取到直链');
     }
@@ -888,6 +970,7 @@ async function resolveByCapture(awemeId) {
   inflightWindow = win;
   let attached = false;
   let result = null;
+  const state = { xhrs: 0 };
 
   try {
     win.webContents.setUserAgent(UA);
@@ -900,6 +983,11 @@ async function resolveByCapture(awemeId) {
       if (method !== 'Network.responseReceived') return;
       const url = params && params.response && params.response.url;
       if (!url) return;
+      const kind = params.type;
+      if ((kind === 'XHR' || kind === 'Fetch') && state.xhrs < 40) {
+        state.xhrs += 1;
+        log('[detail] xhr', params.response.status, kind, urlPath(url));
+      }
       if (/\/aweme\//.test(url)) log('[detail] resp', params.response.status, urlPath(url));
       if (!DETAIL_API.test(url)) return;
       try {
@@ -908,7 +996,7 @@ async function resolveByCapture(awemeId) {
         });
         log('[detail] hit', urlPath(url), 'bodyLen=' + (body ? body.length : 0));
         const json = JSON.parse(body);
-        const list = json.aweme_list || json.aweme_details || [];
+        const list = json.aweme_list || json.aweme_details || (json.aweme_detail ? [json.aweme_detail] : []);
         const item = Array.isArray(list) ? list[0] : null;
         if (!item) {
           log('[detail] 响应里没有 aweme');
@@ -933,18 +1021,34 @@ async function resolveByCapture(awemeId) {
         log('[detail] body-fail', urlPath(url), error.message);
       }
     });
-    await debuggerApi.sendCommand('Network.enable');
+    // 同样不能 await Network.enable：一旦不返回，后面 loadURL 都执行不到（单条作品卡死的原因）
+    withTimeout(debuggerApi.sendCommand('Network.enable'), 3000, 'Network.enable')
+      .then(() => log('[detail] Network.enable 完成'))
+      .catch((error) => log('[detail] Network.enable 异常:', error.message));
 
-    await win.loadURL(`https://www.douyin.com/video/${awemeId}`, { userAgent: UA });
+    // 分享页轻、Web 页稳：依次尝试，谁先出结果用谁
+    const entries = [
+      `https://www.iesdouyin.com/share/video/${awemeId}/`,
+      `https://www.douyin.com/video/${awemeId}`,
+    ];
+    for (let i = 0; i < entries.length; i++) {
+      if (result) break;
+      const entry = entries[i];
+      log('[detail] 入口 ' + (i + 1) + '/' + entries.length + ' ' + urlPath(entry));
+      win.loadURL(entry, { userAgent: UA })
+        .then(() => log('[detail] loadURL 完成 ' + urlPath(entry)))
+        .catch((error) => log('[detail] loadURL 失败:', error.message));
+      const startedAt = Date.now();
+      while (Date.now() - startedAt < DETAIL_WAIT_MS && !result) {
+        await delay(300);
+      }
+      log('[perf] 入口' + (i + 1) + ' 等待结束 ' + (Date.now() - startedAt) + 'ms got=' + !!result + ' xhr=' + state.xhrs);
+    }
+
     try {
       log('[detail] title=' + JSON.stringify((await win.webContents.getTitle()) || ''));
     } catch (_) {}
-
-    const startedAt = Date.now();
-    while (Date.now() - startedAt < FIRST_PAGE_TIMEOUT_MS && !result) {
-      await delay(400);
-    }
-    if (!result) throw new Error('未获取到无水印直链（可能触发风控，可在设置里打开「显示解析窗口」重试）');
+    if (!result) throw new Error('未获取到无水印直链（可能触发风控，可在设置里打开「解析合集时显示窗口」后重试）');
     return result;
   } finally {
     try {
@@ -1104,6 +1208,61 @@ async function fetchPlaylet(playletId, onProgress) {
   };
 }
 
+// ===== 登录态 =====
+function parseSession() {
+  const { session } = require('electron');
+  return session.fromPartition('persist:douyin-parse');
+}
+
+/** 是否已登录（看抖音的关键 Cookie） */
+async function loginStatus() {
+  try {
+    const ses = parseSession();
+    const cookies = await ses.cookies.get({ domain: '.douyin.com' });
+    const hit = cookies.find((item) => LOGIN_COOKIE_NAMES.includes(item.name) && item.value);
+    const nickname = (cookies.find((item) => item.name === 'nickname') || {}).value || '';
+    log('[login] cookie 数=' + cookies.length + ' 已登录=' + !!hit);
+    return {
+      loggedIn: !!hit,
+      cookies: cookies.length,
+      nickname: nickname ? decodeURIComponent(nickname) : '',
+    };
+  } catch (error) {
+    log('[login] 状态检查失败:', error.message);
+    return { loggedIn: false, cookies: 0, nickname: '', error: error.message };
+  }
+}
+
+/** 打开可见的抖音窗口让用户扫码登录；登录态由持久分区保存 */
+async function openLoginWindow() {
+  const { BrowserWindow } = require('electron');
+  closeInflightWindow();
+  const win = new BrowserWindow({
+    width: 1200,
+    height: 900,
+    show: true,
+    title: '抖音登录（登录后可关闭此窗口）',
+    webPreferences: {
+      sandbox: false,
+      contextIsolation: true,
+      nodeIntegration: false,
+      partition: 'persist:douyin-parse',
+      backgroundThrottling: false,
+    },
+  });
+  inflightWindow = win;
+  win.on('closed', () => {
+    if (inflightWindow === win) inflightWindow = null;
+    log('[login] 登录窗口已关闭');
+  });
+  win.webContents.setUserAgent(UA);
+  win.loadURL('https://www.douyin.com/', { userAgent: UA })
+    .then(() => log('[login] 登录页已加载'))
+    .catch((error) => log('[login] 登录页加载失败:', error.message));
+  log('[login] 已打开登录窗口');
+  return { success: true };
+}
+
 function collectionResult(mixId, mixName, author, items, extra = {}) {
   const usableCount = items.filter((item) => item.type === 'video' && item.url).length;
   return {
@@ -1164,12 +1323,18 @@ async function resolveCollection(input, options = {}) {
           log('[result] 该入口没有数据：' + urlPath(pageUrl));
           continue;
         }
+        const keyText = String(keyId);
+        const fallbackName = keyText.startsWith('fav-')
+          ? (keyText === 'fav-favorite' ? '我的喜欢' : '我的收藏')
+          : (/^\d+$/.test(keyText)
+            ? `合集${keyText.slice(-6)}`
+            : (usableName(captured.author) ? `${usableName(captured.author)} 的作品` : `主页${keyText.slice(-6)}`));
         const mixName = usableName(captured.mixName)
           || usableName(captured.detectedName)
           || usableName(hintName)
           || usableName(titleHint)
           || usableName(captured.pageTitle)
-          || `合集${String(keyId).slice(-6)}`;
+          || fallbackName;
         const result = collectionResult(keyId, mixName, captured.author, items);
         log(
           '[result] 成功 name=' + JSON.stringify(mixName),
@@ -1191,6 +1356,23 @@ async function resolveCollection(input, options = {}) {
 
   if (target.kind === 'collection') {
     return finish(await readPage([`https://www.douyin.com/collection/${target.id}`], target.id, '', true));
+  }
+
+  if (target.kind === 'user') {
+    log('[result] 用户主页：' + target.id);
+    return finish(await readPage([`https://www.douyin.com/user/${target.id}`], target.id, '', true));
+  }
+
+  if (target.kind === 'favorites') {
+    const status = await loginStatus();
+    if (!status.loggedIn) {
+      throw new Error('收藏/喜欢需要先登录：请到 设置 → 抖音 → 打开登录窗口，扫码登录后再试');
+    }
+    const tab = target.id === 'favorite' ? 'favorite' : 'collection';
+    log('[result] 我的' + (tab === 'favorite' ? '喜欢' : '收藏') + '（已登录）');
+    return finish(await readPage([
+      `https://www.douyin.com/user/self?showTab=${tab}`,
+    ], `fav-${tab}`, '', true));
   }
 
   if (target.kind === 'playlet') {
@@ -1246,9 +1428,12 @@ async function resolveCollection(input, options = {}) {
 module.exports = {
   UA,
   REFERER,
+  PLAY_REFERER,
   sanitizeName,
   cleanTitle,
   playUrlFromVid,
+  loginStatus,
+  openLoginWindow,
   resolveCollection,
   resolvePlayUrl,
   resolveCollectionTarget,
