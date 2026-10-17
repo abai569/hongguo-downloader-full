@@ -196,6 +196,11 @@ body {
   padding: 24px 32px;
 }
 
+/* 页面保活容器：切走的页面只是 display:none，组件状态（解析结果等）保留 */
+.page-slot {
+  min-width: 0;
+}
+
 
 /* ===== 通用按钮与输入控件 ===== */
 .btn {

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Film, Download, Settings, Play, Sparkles, Music } from './components/icons';
 import HongguoDownload from './components/HongguoDownload';
 import DouyinDownload from './components/DouyinDownload';
@@ -74,24 +74,33 @@ export default function App() {
     });
   }, []);
 
-  const renderPage = () => {
-    switch (page) {
-      case 'browse':
-        return <Browse onNavigate={setPage} />;
-      case 'player':
-        return <Player target={playerTarget} onNavigate={setPage} />;
-      case 'manager':
-        return <DownloadManager onNavigate={setPage} />;
-      case 'settings':
-        return <SettingsPage />;
-      case 'download':
-        return <HongguoDownload onNavigate={setPage} />;
-      case 'douyin':
-        return <DouyinDownload onNavigate={setPage} />;
-      default:
-        return <HongguoDownload onNavigate={setPage} />;
+  // 页面保活：切走的页面只隐藏、不卸载。
+  // 否则离开「抖音下载」再回来，解析结果全丢，得重新解析一遍（很慢）。
+  // 播放页例外：离开即卸载，避免后台继续出声。
+  const [visited, setVisited] = useState(() => new Set([page]));
+  const contentRef = useRef(null);
+  const scrollMap = useRef({});
+  const prevPageRef = useRef(page);
+
+  useEffect(() => {
+    setVisited((prev) => (prev.has(page) ? prev : new Set(prev).add(page)));
+    const el = contentRef.current;
+    if (!el) return;
+    // 每个页面记住自己的滚动位置，切回来时还原
+    if (prevPageRef.current !== page) {
+      scrollMap.current[prevPageRef.current] = el.scrollTop;
+      el.scrollTop = scrollMap.current[page] || 0;
+      prevPageRef.current = page;
     }
-  };
+  }, [page]);
+
+  const PAGES = [
+    { id: 'browse', node: <Browse onNavigate={setPage} /> },
+    { id: 'download', node: <HongguoDownload onNavigate={setPage} /> },
+    { id: 'douyin', node: <DouyinDownload onNavigate={setPage} /> },
+    { id: 'manager', node: <DownloadManager onNavigate={setPage} /> },
+    { id: 'settings', node: <SettingsPage /> },
+  ];
 
   return (
     <div className="app-layout">
@@ -139,7 +148,20 @@ export default function App() {
 
       {/* 右侧主体区域 */}
       <div className="main-wrapper">
-        <div className="main-content">{renderPage()}</div>
+        <div className="main-content" ref={contentRef}>
+          {PAGES.map(({ id, node }) => (
+            visited.has(id) ? (
+              <div key={id} className="page-slot" style={{ display: page === id ? 'block' : 'none' }}>
+                {node}
+              </div>
+            ) : null
+          ))}
+          {page === 'player' && (
+            <div className="page-slot">
+              <Player target={playerTarget} onNavigate={setPage} />
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );

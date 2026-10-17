@@ -47,6 +47,11 @@ function DouyinDownload({ onNavigate }) {
     [collection]
   );
 
+  // 清空：只清输入框内容，解析结果、下载队列都不动
+  const handleClear = () => {
+    setInput('');
+  };
+
   const handleResolve = async () => {
     if (!input.trim()) {
       setErrorMsg('请粘贴抖音合集分享链接或分享文案');
@@ -157,13 +162,21 @@ function DouyinDownload({ onNavigate }) {
           >
             支持：短剧 / 合集 / 单条 / 主页 / 收藏（收藏需登录）
           </span>
-          <div className="dy-actions-right">
+          <div className="dy-actions-row">
             <button
               className="btn btn-outline btn-sm"
               onClick={() => window.electronAPI.openDouyinLog && window.electronAPI.openDouyinLog()}
               title="解析卡住或失败时，把日志文件发给开发者"
             >
               日志
+            </button>
+            <button
+              className="btn btn-outline btn-sm"
+              onClick={handleClear}
+              disabled={!input}
+              title="清空输入框内容"
+            >
+              清空
             </button>
             <button className="btn btn-primary" onClick={handleResolve} disabled={loading}>
               {loading ? (
@@ -172,10 +185,7 @@ function DouyinDownload({ onNavigate }) {
                   <span>解析中…</span>
                 </>
               ) : (
-                <>
-                  <Music size={16} />
-                  <span>解析</span>
-                </>
+                <span>解析</span>
               )}
             </button>
             {/* 解析状态跟在两个按钮右边，不再单独占一行 */}
