@@ -119,3 +119,38 @@
   font-size: 13px;
   color: var(--text-secondary, #8b8b95);
 }
+
+/* 每行的「合并整部」按钮 */
+.lan-group-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1 1 auto;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.lan-merge-btn {
+  flex-shrink: 0;
+  margin-left: 8px;
+}
+
+/* 顶部小提示 */
+.lan-toast {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  margin-bottom: 12px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+  color: #18a058;
+  background: rgba(24, 160, 88, 0.14);
+  border: 1px solid rgba(24, 160, 88, 0.3);
+}
+/* 集数紧跟在剧名后面 */
+.lan-group-count {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--text-secondary, #8b8b95);
+}

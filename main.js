@@ -1470,7 +1470,10 @@ function seriesHasLocalFiles(seriesId, seriesTitle) {
 ipcMain.handle('get-series-list', async () => {
   const hongguo = visibleSeries().filter((s) => seriesHasLocalFiles(s.series_id, s.series_title));
   const douyin = douyinCollectionList();
-  return [...hongguo, ...douyin];
+  // 合并下拉框也按「系列名 + 季号」排，别让第一季跑到最后（中文拼音排序会把"一"排最后）
+  return [...hongguo, ...douyin].sort((a, b) =>
+    compareGroupNames(String(a.series_title || ''), String(b.series_title || ''))
+  );
 });
 
 /** 已下载的抖音合集，伪造成 series 条目供「一键合并」下拉框复用 */
@@ -1739,20 +1742,34 @@ function probeVideoInfo(ffprobePath, file) {
     const { execFile } = require('child_process');
     execFile(
       ffprobePath,
-      ['-v', 'error', '-select_streams', 'v:0',
-       '-show_entries', 'stream=codec_name,width,height,avg_frame_rate', '-of', 'json', file],
+      ['-v', 'error',
+       '-show_entries', 'stream=codec_type,codec_name,profile,width,height,avg_frame_rate,sample_rate,channels',
+       '-of', 'json', file],
       { timeout: 30000 },
       (err, stdout) => {
         if (err) return resolve(null);
         try {
           const j = JSON.parse(stdout);
-          const s = (j.streams || [])[0];
+          const streams = j.streams || [];
+          const s = streams.find((x) => x.codec_type === 'video') || streams[0];
+          const a = streams.find((x) => x.codec_type === 'audio');
           if (!s) return resolve(null);
           // avg_frame_rate 形如 "30/1" / "666055680/46970377"
           let fps = 0;
           const m = String(s.avg_frame_rate || '').split('/');
           if (m.length === 2 && Number(m[1]) > 0) fps = Number(m[0]) / Number(m[1]);
-          resolve({ codec: s.codec_name, w: s.width, h: s.height, fps: Number.isFinite(fps) ? fps : 0 });
+          resolve({
+            codec: s.codec_name,
+            w: s.width,
+            h: s.height,
+            fps: Number.isFinite(fps) ? fps : 0,
+            // 音轨参数也要记录：抖音各集常把 HE-AACv2 和 LC 混着放，
+            // 直接 -c copy 拼接会出解码错误，必须一起比
+            acodec: a ? a.codec_name : '',
+            aprofile: a ? a.profile : '',
+            asr: a ? Number(a.sample_rate) || 0 : 0,
+            ach: a ? Number(a.channels) || 0 : 0,
+          });
         } catch (_) {
           resolve(null);
         }
@@ -1878,6 +1895,49 @@ function collectSeriesEpisodeFiles(seriesId, seriesTitle) {
   };
 }
 
+/**
+ * 合并前把单集音轨统一成 AAC-LC / 48kHz / 立体声（视频流直接 copy，速度接近拷贝）。
+ * keepAudio=false 时丢音轨只留画面（音轨本身坏了时的兜底）。
+ */
+function normalizeMergeAudio(ffmpegPath, src, dst, keepAudio) {
+  return new Promise((resolve) => {
+    const { execFile } = require('child_process');
+    const args = ['-y', '-hide_banner', '-v', 'error', '-i', src, '-c:v', 'copy'];
+    if (keepAudio) {
+      args.push('-c:a', 'aac', '-b:a', '128k', '-ac', '2', '-ar', '48000', '-af', 'aresample=async=1:first_pts=0');
+    } else {
+      args.push('-an');
+    }
+    args.push('-movflags', '+faststart', '-f', 'mp4', dst);
+    execFile(ffmpegPath, args, { timeout: 10 * 60 * 1000, maxBuffer: 8 * 1024 * 1024 }, (err) => {
+      if (err) {
+        try { if (fs.existsSync(dst)) fs.unlinkSync(dst); } catch (_) {}
+        return resolve(false);
+      }
+      try {
+        resolve(fs.existsSync(dst) && fs.statSync(dst).size > 1024 * 100);
+      } catch (_) {
+        resolve(false);
+      }
+    });
+  });
+}
+
+/** 从 ffmpeg 的 stderr 里挑出真正有信息量的报错行（尾部几行往往是 Qavg 之类的统计） */
+function pickFfmpegError(text) {
+  const lines = String(text || '')
+    .split(/\r?\n/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    // Qavg/Qavg 这类只是编码器统计，不是错误
+    .filter((l) => !/Qavg:/i.test(l));
+  const hints = lines.filter((l) =>
+    /error|invalid|cannot|could not|failed|unable|unsupported|not supported|no such|denied|out of memory|too (large|big)/i.test(l)
+  );
+  const picked = (hints.length ? hints : lines).slice(-4);
+  return picked.join(' | ').slice(0, 600);
+}
+
 ipcMain.handle('merge-series', async (event, seriesId, outputName, options) => {
   try {
     const sid = String(seriesId);
@@ -1941,16 +2001,38 @@ ipcMain.handle('merge-series', async (event, seriesId, outputName, options) => {
       }
       if (infos.length > 1) {
         const base = infos[0];
-        baseParams = base;
+        // 转码目标尺寸取「出现最多的分辨率」，而不是首集：
+        // 否则首集若是横屏/小图，会把其余竖屏 4K 全部塞进一个奇怪的大画布，既慢又容易失败
+        const sizeCount = new Map();
+        for (const i of infos) {
+          const key = `${i.w}x${i.h}`;
+          sizeCount.set(key, (sizeCount.get(key) || 0) + 1);
+        }
+        let commonKey = `${base.w}x${base.h}`;
+        let commonCount = 0;
+        for (const [key, count] of sizeCount) {
+          if (count > commonCount) {
+            commonCount = count;
+            commonKey = key;
+          }
+        }
+        baseParams = infos.find((i) => `${i.w}x${i.h}` === commonKey) || base;
         const diff = infos.find(
           (i) =>
             i.codec !== base.codec ||
             i.w !== base.w ||
             i.h !== base.h ||
-            (i.fps && base.fps && Math.abs(i.fps - base.fps) > 0.5)
+            (i.fps && base.fps && Math.abs(i.fps - base.fps) > 0.5) ||
+            // 音轨不一致同样要转码：HE-AACv2 与 LC 混着放在 copy 模式下会解码失败
+            i.acodec !== base.acodec ||
+            i.aprofile !== base.aprofile ||
+            i.asr !== base.asr ||
+            i.ach !== base.ach
         );
         if (diff) {
-          const fmt = (i) => `${i.codec} ${i.w}x${i.h} ${i.fps ? i.fps.toFixed(2) + 'fps' : ''}`.trim();
+          const fmt = (i) =>
+            `${i.codec} ${i.w}x${i.h} ${i.fps ? i.fps.toFixed(2) + 'fps' : ''}`.trim() +
+            (i.acodec ? ` / 音频 ${i.aprofile || i.acodec} ${i.asr}Hz ${i.ach}ch` : '');
           codecWarning = `第 ${diff.vid_index} 集与首集参数不一致（${fmt(diff)} vs ${fmt(base)}）`;
           if (!(options && options.compatible)) {
             autoCompatible = true;
@@ -1962,9 +2044,40 @@ ipcMain.handle('merge-series', async (event, seriesId, outputName, options) => {
     const useCompatible = !!(options && options.compatible) || autoCompatible;
     if (codecWarning) console.log('[Merge]', codecWarning);
 
+    // 兼容（转码）模式下的音轨预处理：
+    // 抖音各集的音频编码常常混着 HE-AACv2 和 LC（extradata 都不一样），
+    // concat 解复用器会沿用第一集的解码配置，读到格式不同的那一集就
+    // 报 "Invalid data found / ESC overflow" 然后整体 Conversion failed。
+    // 所以先把每集音轨统一成 AAC-LC / 48kHz / 立体声（视频直接 copy，很快），
+    // 再拿统一后的文件去拼接。
+    let mergeFiles = ordered;
+    let mergeTmpDir = null;
+    let audioNormalized = false;
+    if (useCompatible) {
+      mergeTmpDir = path.join(outDir, `.merge-tmp-${Date.now().toString(36)}`);
+      try { fs.mkdirSync(mergeTmpDir, { recursive: true }); } catch (_) {}
+      const normalized = [];
+      let okCount = 0;
+      for (let i = 0; i < ordered.length; i++) {
+        const src = ordered[i].path;
+        const dst = path.join(mergeTmpDir, `${String(i + 1).padStart(3, '0')}.mp4`);
+        let ok = await normalizeMergeAudio(ffmpegPath, src, dst, true);
+        if (!ok) ok = await normalizeMergeAudio(ffmpegPath, src, dst, false); // 音轨坏就丢掉音轨保住画面
+        if (ok) {
+          normalized.push({ ...ordered[i], path: dst });
+          okCount += 1;
+        } else {
+          normalized.push(ordered[i]);
+        }
+      }
+      audioNormalized = okCount === ordered.length;
+      mergeFiles = normalized;
+      console.log('[Merge] 音轨预处理完成', okCount + '/' + ordered.length, '音频已统一=' + audioNormalized);
+    }
+
     // 写 concat 列表（UTF-8 无 BOM；绝对路径配 -safe 0，规避中文/空格转义问题）
     const listPath = path.join(outDir, `.${baseName}.ffconcat.txt`);
-    const listBody = ordered.map((e) => `file '${e.path.replace(/\\/g, '/').replace(/'/g, "'\\''")}'`).join('\n');
+    const listBody = mergeFiles.map((e) => `file '${e.path.replace(/\\/g, '/').replace(/'/g, "'\\''")}'`).join('\n');
     fs.writeFileSync(listPath, listBody + '\n', 'utf8');
 
     // 总时长（用于进度百分比）
@@ -2002,7 +2115,8 @@ ipcMain.handle('merge-series', async (event, seriesId, outputName, options) => {
     if (useCompatible) {
       const encoder = await pickH264Encoder(ffmpegPath);
       videoArgs = encoder === 'libx264'
-        ? ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-profile:v', 'high', '-level', '4.2']
+        // 不写死 -profile/-level：混合分辨率/高帧率时 level 限制会让 x264 直接报错退出
+        ? ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23']
         : encoder === 'h264_nvenc'
         ? ['-c:v', 'h264_nvenc', '-preset', 'p4', '-cq', '23', '-b:v', '0']
         : encoder === 'h264_qsv'
@@ -2010,10 +2124,21 @@ ipcMain.handle('merge-series', async (event, seriesId, outputName, options) => {
         : encoder === 'h264_amf'
         ? ['-c:v', 'h264_amf', '-quality', 'speed', '-rc', 'cqp', '-qp_i', '23', '-qp_p', '23']
         : ['-c:v', encoder, '-cq', '23'];
-      videoArgs = [...videoArgs, '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '128k'];
+      // 音轨已在预处理阶段统一成 AAC-LC/48kHz/立体声 → 直接 copy，避免再解码一次
+      // （如果有个别集预处理失败、仍保留混合格式，就老老实实重编码）
+      videoArgs = audioNormalized
+        ? [...videoArgs, '-pix_fmt', 'yuv420p', '-c:a', 'copy']
+        : [
+            ...videoArgs,
+            '-pix_fmt', 'yuv420p',
+            '-c:a', 'aac', '-b:a', '128k', '-ac', '2', '-ar', '48000',
+            '-af', 'aresample=async=1:first_pts=0',
+          ];
       // 各集分辨率/帧率不一致时，转码也要先统一，否则输出尺寸与时间轴仍会错乱
       if (codecWarning && baseParams && baseParams.w && baseParams.h) {
-        const { w, h } = baseParams;
+        // 目标尺寸取偶数，避免 yuv420p 对奇数宽高直接报错
+        const w = baseParams.w % 2 === 0 ? baseParams.w : baseParams.w - 1;
+        const h = baseParams.h % 2 === 0 ? baseParams.h : baseParams.h - 1;
         videoArgs = [
           '-vf', `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,setsar=1`,
           ...videoArgs,
@@ -2060,7 +2185,8 @@ ipcMain.handle('merge-series', async (event, seriesId, outputName, options) => {
 
     let stderrTail = '';
     child.stderr.on('data', (d) => {
-      stderrTail = (stderrTail + d.toString()).slice(-1200);
+      // 只留尾部 20KB，但足够从里面挑出真正的报错行
+      stderrTail = (stderrTail + d.toString()).slice(-20000);
     });
 
     child.on('error', (err) => {
@@ -2072,6 +2198,10 @@ ipcMain.handle('merge-series', async (event, seriesId, outputName, options) => {
 
     child.on('close', (code) => {
       try { fs.unlinkSync(listPath); } catch (_) {}
+      // 清理音轨预处理产生的临时文件
+      if (mergeTmpDir) {
+        try { fs.rmSync(mergeTmpDir, { recursive: true, force: true }); } catch (_) {}
+      }
       delete task.child;
       if (task.cancelled) {
         try { fs.existsSync(tmpOutput) && fs.unlinkSync(tmpOutput); } catch (_) {}
@@ -2109,7 +2239,7 @@ ipcMain.handle('merge-series', async (event, seriesId, outputName, options) => {
       } else {
         task.status = 'failed';
         const hint = useCompatible ? '' : '；可改用「兼容合并」重试';
-        task.error = `ffmpeg 退出码 ${code}${stderrTail ? '：' + stderrTail.split('\n').filter(Boolean).slice(-2).join(' ') : ''}${hint}`;
+        task.error = `ffmpeg 退出码 ${code}${stderrTail ? '：' + pickFfmpegError(stderrTail) : ''}${hint}`;
         try { fs.existsSync(tmpOutput) && fs.unlinkSync(tmpOutput); } catch (_) {}
       }
       saveMergeTasks();
@@ -3959,7 +4089,7 @@ function listShareFiles(options) {
     // 同一分组里，合并产物排最前，其余按文件名（即集号）
     const ga = shareGroup(a.rel);
     const gb = shareGroup(b.rel);
-    if (ga !== gb) return a.rel.localeCompare(b.rel, 'zh-Hans-CN');
+    if (ga !== gb) return compareGroupNames(ga, gb);
     const ma = a.merged ? 0 : 1;
     const mb = b.merged ? 0 : 1;
     if (ma !== mb) return ma - mb;
@@ -3987,6 +4117,21 @@ function shareGroup(rel) {
   return '未分类';
 }
 
+/**
+ * 分组（剧名）排序：先按系列名，再按季号数字升序。
+ * 注意不能用 localeCompare 直接排 —— 中文按拼音排序时
+ * 二(èr) < 三(sān) < 一(yī)，会把「第一季」排到最后。
+ */
+function compareGroupNames(a, b) {
+  const ba = seriesBaseTitle(a);
+  const bb = seriesBaseTitle(b);
+  if (ba !== bb) return ba.localeCompare(bb, 'zh-Hans-CN');
+  const sa = seasonOfTitle(a);
+  const sb = seasonOfTitle(b);
+  if (sa !== sb) return sa - sb;
+  return String(a).localeCompare(String(b), 'zh-Hans-CN');
+}
+
 /** 列表里显示的名字（去掉分组前缀，分组交给 group-title） */
 function shareChannelName(rel, merged) {
   // 合并产物：给个显眼的固定名，一眼就知道是整部连播
@@ -4004,6 +4149,26 @@ function lanMergedOnlySet() {
   return new Set(Array.isArray(raw) ? raw.map(String) : []);
 }
 
+/** 分组名（文件夹名）反查 series_id，供共享页直接触发合并 */
+function shareGroupSeriesId(groupName) {
+  const folder = String(groupName || '').trim();
+  if (!folder) return '';
+  const root = shareRoot();
+  // 1) 抖音：任务记录里有同名合集
+  for (const t of downloadTasks) {
+    if (!t.douyinInfo) continue;
+    const name = sanitizeFolderName(t.douyinInfo.mix_name);
+    if (name && name === folder) return 'douyin:' + String(t.douyinInfo.mix_id);
+  }
+  // 2) 抖音：磁盘上的合集目录（任务已删但文件还在）
+  if (fs.existsSync(path.join(root, '抖音', folder))) return 'douyin:disk:' + folder;
+  // 3) 红果：登记表里同名
+  for (const s of seriesRegistry) {
+    if (sanitizeFolderName(s.series_title) === folder) return String(s.series_id);
+  }
+  return '';
+}
+
 /** 每个分组的统计：单集数 / 整部数 / 是否勾了只显示整部 */
 function shareGroupsSummary() {
   const files = listShareFiles({ raw: true });
@@ -4017,12 +4182,17 @@ function shareGroupsSummary() {
     else row.episodes += 1;
   }
   const mergedOnly = lanMergedOnlySet();
-  return [...map.values()].map((row) => ({
-    ...row,
-    hasMerged: row.merged > 0,
-    // 没有合并文件的剧不允许开启（开了分组就空了）
-    mergedOnly: mergedOnly.has(row.name) && row.merged > 0,
-  }));
+  // 显式再排一次，避免依赖文件顺序（拼音排序会把「第一季」扔到最后）
+  return [...map.values()]
+    .sort((a, b) => compareGroupNames(a.name, b.name))
+    .map((row) => ({
+      ...row,
+      hasMerged: row.merged > 0,
+      // 共享页可以直接点「合并整部」，所以带上 series_id
+      seriesId: shareGroupSeriesId(row.name),
+      // 没有合并文件的剧不允许开启（开了分组就空了）
+      mergedOnly: mergedOnly.has(row.name) && row.merged > 0,
+    }));
 }
 
 /** M3U：带 group-title，电视端会按合集名分类显示 */

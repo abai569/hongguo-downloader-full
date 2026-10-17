@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import './LanShare.css';
-import { Share2, Copy, RefreshCw, Play, Folder, AlertCircle } from './icons';
+import { Share2, Copy, RefreshCw, Play, Folder, AlertCircle, Layers } from './icons';
 
 /**
  * 局域网共享（电视播放）独立页面。
@@ -13,7 +13,16 @@ function LanShare({ onNavigate, active }) {
   const [groups, setGroups] = useState([]);
   const [copiedKey, setCopiedKey] = useState('');
   const [error, setError] = useState('');
+  const [mergingName, setMergingName] = useState(''); // 正在合并哪部剧
+  const [toast, setToast] = useState('');
   const timerRef = useRef(null);
+  const toastTimerRef = useRef(null);
+
+  const showToast = useCallback((msg) => {
+    setToast(msg);
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => setToast(''), 4000);
+  }, []);
 
   const loadAll = useCallback(async () => {
     const api = window.electronAPI;
@@ -64,6 +73,28 @@ function LanShare({ onNavigate, active }) {
     };
   }, [status.running, loadAll]);
 
+  // 合并完成/失败：刷新列表（新出现的「▶ 整部连播」要能立刻勾起来）
+  useEffect(() => {
+    const api = window.electronAPI;
+    if (!api) return undefined;
+    const cleanups = [];
+    if (api.onMergeCompleted) {
+      cleanups.push(api.onMergeCompleted(() => {
+        setMergingName('');
+        showToast('合并完成，可以勾「只显示整部」了');
+        loadAll();
+      }));
+    }
+    if (api.onMergeFailed) {
+      cleanups.push(api.onMergeFailed((data) => {
+        setMergingName('');
+        setError((data && data.error) || '合并失败');
+        loadAll();
+      }));
+    }
+    return () => cleanups.forEach((fn) => { try { fn(); } catch (_) {} });
+  }, [loadAll, showToast]);
+
   const toggle = async (next) => {
     const api = window.electronAPI;
     if (!api || !api.lanShareStart) return;
@@ -108,10 +139,35 @@ function LanShare({ onNavigate, active }) {
     } catch (_) {}
   };
 
+  // 直接在共享页触发「合并整部」，不用再跑去下载管理
+  const startMerge = async (row) => {
+    const api = window.electronAPI;
+    if (!api || !api.mergeSeries) return;
+    if (!row.seriesId) {
+      setError(`没找到「${row.name}」的剧集标识，可能数据还没登记，去下载管理里合并这一步更稳`);
+      return;
+    }
+    setError('');
+    setMergingName(row.name);
+    try {
+      const res = await api.mergeSeries(row.seriesId, '', { compatible: false });
+      if (!res || !res.success) {
+        setError((res && res.error) || '合并启动失败');
+        setMergingName('');
+        return;
+      }
+      showToast(`已开始合并「${row.name}」，可继续用软件，合并完成会自动出现在这里`);
+    } catch (err) {
+      setError(err.message || '合并启动失败');
+      setMergingName('');
+    }
+  };
+
   const copyLabel = (key, text) => (copiedKey === key ? '已复制' : text);
 
   return (
     <div className="lan-container">
+      {toast && <div className="lan-toast">{toast}</div>}
       <div className="hongguo-hero">
         <div className="hero-icon">
           <Share2 size={32} />
@@ -194,14 +250,17 @@ function LanShare({ onNavigate, active }) {
         ) : (
           <div className="lan-group-list">
             {groups.map((g) => (
-              <label key={g.name} className={`lan-group-row ${g.hasMerged ? '' : 'is-disabled'}`}>
-                <input
-                  type="checkbox"
-                  checked={!!g.mergedOnly}
-                  disabled={!g.hasMerged}
-                  onChange={(e) => setMergedOnly(g.name, e.target.checked)}
-                />
-                <span className="lan-group-name" title={g.name}>{g.name}</span>
+              <div key={g.name} className="lan-group-row">
+                <label className="lan-group-main">
+                  <input
+                    type="checkbox"
+                    checked={!!g.mergedOnly}
+                    disabled={!g.hasMerged}
+                    onChange={(e) => setMergedOnly(g.name, e.target.checked)}
+                  />
+                  <span className="lan-group-name" title={g.name}>{g.name}</span>
+                  <span className="lan-group-count">{g.episodes} 集</span>
+                </label>
                 <span className="lan-group-meta">
                   {g.hasMerged ? (
                     <span className="lan-merged-tag">
@@ -210,9 +269,27 @@ function LanShare({ onNavigate, active }) {
                   ) : (
                     <span className="lan-plain-tag">未合并</span>
                   )}
-                  {g.episodes} 集{g.merged > 0 ? ` · ${g.merged} 个整部` : ''}
+                  {g.merged > 0 ? ` · ${g.merged} 个整部` : ''}
                 </span>
-              </label>
+                {!g.hasMerged && (
+                  <button
+                    className="btn btn-outline btn-sm lan-merge-btn"
+                    disabled={mergingName === g.name || !g.seriesId}
+                    title={g.seriesId ? '把该剧所有已下载分集合并成一个文件' : '找不到剧集标识，请到「下载管理」里合并'}
+                    onClick={() => startMerge(g)}
+                  >
+                    {mergingName === g.name ? (
+                      <>
+                        <RefreshCw size={13} className="spin" /> 合并中…
+                      </>
+                    ) : (
+                      <>
+                        <Layers size={13} /> 合并整部
+                      </>
+                    )}
+                  </button>
+                )}
+              </div>
             ))}
           </div>
         )}
