@@ -17,6 +17,13 @@ function HongguoDownload({ onNavigate }) {
   const [rangeInput, setRangeInput] = useState('');
   const [submitting, setSubmitting] = useState(false);
 
+  // 滚动容器是 .main-content（不是 window），切到解析界面后要滚回顶部
+  const scrollToTop = () => {
+    const el = document.querySelector('.main-content');
+    if (el && typeof el.scrollTo === 'function') el.scrollTo({ top: 0, behavior: 'smooth' });
+    else window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
   // 搜索选中一部剧后：复用既有的选集下载界面
   const handleSeriesFromSearch = (data) => {
     setErrorMsg('');
@@ -24,7 +31,7 @@ function HongguoDownload({ onNavigate }) {
     setSeriesData(data);
     setSelectedVids(new Set(data.episodes.map((ep) => ep.vid)));
     setSuccessMsg(`已选中《${data.series_title}》共 ${data.total} 集，可直接提交下载`);
-    window.scrollTo({ top: 0, behavior: 'smooth' });
+    scrollToTop();
   };
 
   // 解析红果短剧
@@ -148,7 +155,7 @@ function HongguoDownload({ onNavigate }) {
         episodes: selectedEps,
       });
       if (res.success) {
-        setSuccessMsg(`已成功将 ${res.count} 集提交至下载队列！点击下方按钮跳转至“下载管理”查看实时进度。`);
+        setSuccessMsg(`已提交 ${res.count} 集，可在「下载管理」查看实时进度。`);
       } else {
         setErrorMsg(res.error || '提交下载失败');
       }
@@ -190,13 +197,18 @@ function HongguoDownload({ onNavigate }) {
         </button>
       </div>
 
-      {tab === 'search' ? (
+      {/* 两个面板都保持挂载，只切换显示：
+          否则「搜索剧集」里搜到的结果会在切到「粘贴链接/ID」后被卸载丢掉，
+          回来还得重新搜一次 */}
+      <div style={{ display: tab === 'search' ? 'block' : 'none' }}>
         <SearchPanel
           onSelectSeries={handleSeriesFromSearch}
           onSwitchToInput={() => setTab('input')}
         />
-      ) : (
-        /* 解析输入卡片 */
+      </div>
+
+      <div style={{ display: tab === 'input' ? 'block' : 'none' }}>
+        {/* 解析输入卡片 */}
         <div className="hongguo-card">
           <div className="card-header-title">
             <Sparkles size={18} />
@@ -226,13 +238,14 @@ function HongguoDownload({ onNavigate }) {
             </button>
           </div>
 
-          {errorMsg && <div className="alert alert-error">{errorMsg}</div>}
-          {successMsg && <div className="alert alert-success">{successMsg}</div>}
+          {/* 已选中剧集时，提示统一放到下面按钮那行的下一行，避免上下重复 */}
+          {!seriesData && errorMsg && <div className="alert alert-error">{errorMsg}</div>}
+          {!seriesData && successMsg && <div className="alert alert-success">{successMsg}</div>}
         </div>
-      )}
+      </div>
 
-      {/* 搜索模式下的提示信息（解析卡片被替换了，这里单独显示） */}
-      {tab === 'search' && (errorMsg || successMsg) && (
+      {/* 搜索模式下的提示信息（解析卡片被隐藏了，这里单独显示） */}
+      {!seriesData && tab === 'search' && (errorMsg || successMsg) && (
         <div className="hongguo-card" style={{ marginTop: 0 }}>
           {errorMsg && <div className="alert alert-error">{errorMsg}</div>}
           {successMsg && <div className="alert alert-success">{successMsg}</div>}
@@ -278,6 +291,14 @@ function HongguoDownload({ onNavigate }) {
                 </button>
               )}
             </div>
+
+            {/* 提示放到按钮下一行 */}
+            {(successMsg || errorMsg) && (
+              <div className="batch-status">
+                {successMsg && <span className="batch-status-ok">{successMsg}</span>}
+                {errorMsg && <span className="batch-status-err">{errorMsg}</span>}
+              </div>
+            )}
           </div>
 
           {/* 筛选与操作栏 */}

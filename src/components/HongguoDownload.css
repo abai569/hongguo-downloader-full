@@ -175,6 +175,23 @@
 .batch-action-bar {
   display: flex;
   gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+/* 按钮下一行的提示（已选中 xx 集 / 提交结果） */
+.batch-status {
+  margin-top: 10px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.batch-status-ok {
+  color: #18a058;
+}
+
+.batch-status-err {
+  color: #d03050;
 }
 
 /* 控件与筛选 */

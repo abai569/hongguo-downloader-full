@@ -247,9 +247,9 @@ function DouyinDownload({ onNavigate }) {
                   <span>查看下载管理</span>
                 </button>
               )}
-              {/* 提交结果跟在两个按钮右侧，而不是跑到上面的解析栏 */}
-              {submitMsg && <span className="dy-submit-msg">{submitMsg}</span>}
             </div>
+            {/* 提交结果放到按钮的下一行 */}
+            {submitMsg && <div className="dy-submit-msg">{submitMsg}</div>}
           </div>
 
           <div className="controls-row">

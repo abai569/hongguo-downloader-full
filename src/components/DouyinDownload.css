@@ -42,7 +42,7 @@
   justify-content: flex-start;
 }
 
-/* 下载操作栏：提交结果紧跟在「下载选中作品 / 查看下载管理」右侧 */
+/* 下载操作栏：按钮一行，提交结果单独一行 */
 .dy-batch-bar {
   align-items: center;
   flex-wrap: wrap;
@@ -50,11 +50,10 @@
 }
 
 .dy-submit-msg {
+  margin-top: 10px;
   font-size: 12px;
   line-height: 1.6;
   color: #18a058;
-  /* 空间够就留在按钮右侧（内部换行），不够才整体换到下一行 */
-  flex: 1 1 240px;
   min-width: 0;
 }
 
