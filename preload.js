@@ -4,6 +4,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // 应用信息 / 官网链接
   getAppInfo: () => ipcRenderer.invoke('get-app-info'),
   openExternalUrl: (url) => ipcRenderer.invoke('open-external-url', url),
+  // 复制文本到系统剪贴板（页脚 QQ 群号等）
+  copyText: (text) => ipcRenderer.invoke('copy-text', text),
 
 
   // 红果解析与下载

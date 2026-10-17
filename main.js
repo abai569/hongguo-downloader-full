@@ -9,7 +9,7 @@
  *   4. 下载管理：进度推送、暂停/取消、重试、删除、打开所在文件夹
  *   5. 设置：下载目录、命名规则、并发数（JSON 文件持久化）
  */
-const { app, BrowserWindow, ipcMain, dialog, shell, session, protocol, Tray, Menu, nativeImage } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, session, protocol, Tray, Menu, nativeImage, clipboard } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const fsp = require('fs/promises');
@@ -3541,6 +3541,18 @@ ipcMain.handle('get-app-info', async () => ({
   brand: APP_TITLE,
   appName: APP_TITLE,
 }));
+
+// 复制文本到系统剪贴板（页脚 QQ 群号点击复制）
+ipcMain.handle('copy-text', async (event, text) => {
+  const value = String(text == null ? '' : text);
+  if (!value) return { success: false, error: '没有可复制的内容' };
+  try {
+    clipboard.writeText(value);
+    return { success: true, text: value };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
 
 // 打开外部链接（保留给需要时调用）
 ipcMain.handle('open-external-url', async (event, url) => {

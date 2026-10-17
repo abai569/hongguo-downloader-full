@@ -20,6 +20,43 @@ export default function App() {
   const [page, setPage] = useState('browse');
   const [appInfo, setAppInfo] = useState(null); // { version, brand, appName }
   const [playerTarget, setPlayerTarget] = useState(null); // 浏览页点播 -> 播放页选中
+  const [copied, setCopied] = useState(false); // 页脚群号「已复制」反馈
+
+  // 点击页脚群号 -> 复制到系统剪贴板，2 秒后恢复原文案
+  const handleCopyGroup = async () => {
+    const group = '1109483648';
+    let ok = false;
+    try {
+      if (window.electronAPI && window.electronAPI.copyText) {
+        const res = await window.electronAPI.copyText(group);
+        ok = !!(res && res.success);
+      }
+    } catch (_) {}
+    if (!ok) {
+      // 兜底：浏览器剪贴板 / 临时 textarea
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(group);
+          ok = true;
+        }
+      } catch (_) {}
+    }
+    if (!ok) {
+      try {
+        const el = document.createElement('textarea');
+        el.value = group;
+        el.style.position = 'fixed';
+        el.style.opacity = '0';
+        document.body.appendChild(el);
+        el.select();
+        ok = document.execCommand('copy');
+        document.body.removeChild(el);
+      } catch (_) {}
+    }
+    if (!ok) return;
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
 
   useEffect(() => {
     window.electronAPI.getAppInfo().then((info) => {
@@ -89,7 +126,14 @@ export default function App() {
         </div>
 
         <div className="sidebar-footer">
-          <div className="footer-note">QQ交流群：1109483648</div>
+          <button
+            type="button"
+            className={`footer-note footer-copy ${copied ? 'is-copied' : ''}`}
+            onClick={handleCopyGroup}
+            title="点击复制 QQ 群号"
+          >
+            {copied ? '已复制：1109483648' : 'QQ交流群：1109483648'}
+          </button>
         </div>
       </div>
 

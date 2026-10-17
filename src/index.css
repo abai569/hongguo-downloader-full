@@ -157,6 +157,28 @@ body {
   gap: 10px;
 }
 
+/* 页脚 QQ 群号：可点击复制 */
+.sidebar-footer .footer-copy {
+  all: unset;
+  cursor: pointer;
+  font-size: 11px;
+  color: #8a93a8;
+  border-radius: 6px;
+  padding: 2px 4px;
+  margin: -2px -4px;
+  transition: color 0.15s ease, background 0.15s ease;
+  align-self: flex-start;
+}
+
+.sidebar-footer .footer-copy:hover {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.sidebar-footer .footer-copy.is-copied {
+  color: #3ddc97;
+}
+
 /* 主内容区包裹器 */
 .main-wrapper {
   flex: 1;
