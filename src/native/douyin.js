@@ -544,8 +544,10 @@ async function capturePage(pageUrlOrId, options) {
     // 滚动需要 DOM 就绪，但最多再等 6 秒，不能无限等
     await Promise.race([loadPromise, delay(6000)]);
     log('[perf] 页面就绪 ' + (Date.now() - t0) + 'ms');
+    let pageTitle = '';
     try {
-      log('[capture] title=' + JSON.stringify((await win.webContents.getTitle()) || ''));
+      pageTitle = String((await win.webContents.getTitle()) || '').trim();
+      log('[capture] title=' + JSON.stringify(pageTitle));
     } catch (_) {}
 
     if (!hasCapture(state)) {
@@ -596,11 +598,11 @@ async function capturePage(pageUrlOrId, options) {
       const domIds = await scrapeDomIds(win);
       log('[capture] DOM 兜底 id 数=' + domIds.length);
       if (domIds.length) {
-        return { pages: state.pages, domIds, media: state.media, mixName, author };
+        return { pages: state.pages, domIds, media: state.media, mixName, author, pageTitle };
       }
     }
 
-    return { pages: state.pages, domIds: [], media: state.media, mixName, author };
+    return { pages: state.pages, domIds: [], media: state.media, mixName, author, pageTitle };
   } finally {
     try {
       if (attached) win.webContents.debugger.detach();
@@ -870,6 +872,12 @@ async function resolveCollection(input, options = {}) {
   const onProgress = options.onProgress || (() => {});
   const target = await resolveCollectionTarget(input, { showWindow: options.showWindow });
   log('[target] kind=' + target.kind + ' id=' + target.id);
+
+  // 分享文案里常带【剧名】，比 合集<id> 友好得多
+  const bracketMatch = String(input || '').match(/[【\[]([^】\]]{2,40})[】\]]/);
+  const titleHint = bracketMatch ? sanitizeName(bracketMatch[1]) : '';
+  if (titleHint) log('[input] 文案标题=' + titleHint);
+
   onProgress({ stage: 'opening', pages: 0, found: 0 });
 
   const readPage = async (pageUrl, keyId, hintName, paged) => {
@@ -883,7 +891,11 @@ async function resolveCollection(input, options = {}) {
       log('[result] 失败：没有解析到任何作品（' + urlPath(pageUrl) + '）');
       throw new Error('未能解析出作品列表；若页面要求验证，请到设置里打开「解析合集时显示窗口」后重试');
     }
-    const mixName = sanitizeName(captured.mixName) || sanitizeName(hintName) || `合集${String(keyId).slice(-6)}`;
+    const mixName = sanitizeName(captured.mixName)
+      || sanitizeName(hintName)
+      || titleHint
+      || sanitizeName(captured.pageTitle)
+      || `合集${String(keyId).slice(-6)}`;
     const result = collectionResult(keyId, mixName, captured.author, items);
     log(
       '[result] 成功 name=' + JSON.stringify(mixName),
