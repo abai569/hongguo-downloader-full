@@ -1,11 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Film, Download, Settings, Play, Sparkles, Music } from './components/icons';
+import { Film, Download, Settings, Play, Sparkles, Music, Share2 } from './components/icons';
 import HongguoDownload from './components/HongguoDownload';
 import DouyinDownload from './components/DouyinDownload';
 import DownloadManager from './components/DownloadManager';
 import SettingsPage from './components/Settings';
 import Player from './components/Player';
 import Browse from './components/Browse';
+import LanShare from './components/LanShare';
 
 const MENU = [
   { id: 'browse', label: '浏览', icon: Sparkles },
@@ -13,6 +14,7 @@ const MENU = [
   { id: 'download', label: '红果下载', icon: Film },
   { id: 'douyin', label: '抖音下载', icon: Music },
   { id: 'manager', label: '下载管理', icon: Download },
+  { id: 'lan', label: '共享', icon: Share2 },
   { id: 'settings', label: '设置', icon: Settings },
 ];
 
@@ -99,7 +101,8 @@ export default function App() {
     { id: 'download', node: <HongguoDownload onNavigate={setPage} /> },
     { id: 'douyin', node: <DouyinDownload onNavigate={setPage} /> },
     { id: 'manager', node: <DownloadManager onNavigate={setPage} active={page === 'manager'} /> },
-    { id: 'settings', node: <SettingsPage /> },
+    { id: 'lan', node: <LanShare onNavigate={setPage} active={page === 'lan'} /> },
+    { id: 'settings', node: <SettingsPage onNavigate={setPage} /> },
   ];
 
   return (

@@ -128,6 +128,8 @@ function getDefaultSettings() {
     // 局域网共享（电视/手机播放已下载视频）：开启后启动内置 HTTP 服务
     lan_share_enabled: false,
     lan_share_port: 8899,
+    // 这些剧在播放列表里只显示「整部连播」（隐藏单集）；没合并过的剧不生效
+    lan_share_merged_only: [],
     // ===== 网络代理 =====
     // proxy_enabled: 是否启用代理（关闭时忽略系统代理，直连）
     // proxy_mode:    system=跟随系统/环境变量 · custom=手动指定 · direct=强制直连
@@ -1255,6 +1257,63 @@ const BROWSE_META_JS = `(() => {
   return JSON.stringify(out);
 })()`;
 
+/**
+ * 搜索/分类结果排序：同一部剧的多季要挨在一起，且按「第一季 → 第二季 → …」排。
+ * 红果站点返回的顺序是乱的（第一季常常排到后面），这里统一整理。
+ */
+const SEASON_DIGITS = { 零: 0, 〇: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+function cnNumber(text) {
+  const s = String(text || '').trim();
+  if (!s) return 0;
+  if (/^\d+$/.test(s)) return parseInt(s, 10);
+  let section = 0;
+  let num = 0;
+  for (const ch of s) {
+    if (SEASON_DIGITS[ch] !== undefined) num = SEASON_DIGITS[ch];
+    else if (ch === '十') { section += (num || 1) * 10; num = 0; }
+    else return 0;
+  }
+  return section + num;
+}
+
+function seasonOfTitle(title) {
+  const s = String(title || '');
+  let m = s.match(/第\s*(\d{1,2})\s*季/);
+  if (m) return parseInt(m[1], 10);
+  m = s.match(/第\s*([零〇一二两三四五六七八九十]{1,3})\s*季/);
+  if (m) return cnNumber(m[1]);
+  m = s.match(/(\d{1,2})\s*季/);
+  if (m) return parseInt(m[1], 10);
+  m = s.match(/([零〇一二两三四五六七八九十]{1,3})\s*季/);
+  if (m) return cnNumber(m[1]);
+  return 0;
+}
+
+function seriesBaseTitle(title) {
+  return String(title || '')
+    // 「末世靠山王：玩的脏才站得稳第三季」-> 取冒号前的系列名
+    .replace(/[：:].*$/, '')
+    .replace(/\s*第?\s*[0-9零〇一二两三四五六七八九十]+\s*季\s*$/, '')
+    .replace(/\s+/g, '')
+    .trim();
+}
+
+function sortSeriesResults(list) {
+  const rows = (Array.isArray(list) ? list : []).map((item, i) => ({
+    item,
+    base: seriesBaseTitle(item && item.series_title),
+    season: seasonOfTitle(item && item.series_title),
+    order: i,
+  }));
+  rows.sort((a, b) => {
+    if (a.base !== b.base) return a.base.localeCompare(b.base, 'zh-Hans-CN');
+    // 没写季号的（本体）排最前，然后按季号升序
+    if (a.season !== b.season) return a.season - b.season;
+    return a.order - b.order;
+  });
+  return rows.map((r) => r.item);
+}
+
 /** 页面结构与搜索页一致，分类页复用同一个嗅探 + 串行队列 */
 async function runSniffOnUrl(url, label) {
   const win = getSearchWindow();
@@ -1296,12 +1355,14 @@ async function runSniffOnUrl(url, label) {
       return { success: true, results: [], pageTitle, meta };
     }
 
-    const results = last
-      .filter((r) => r.series_id && r.series_title)
-      .map((r) => ({
-        ...r,
-        url: `${SEARCH_SITE}/detail?series_id=${r.series_id}`,
-      }));
+    const results = sortSeriesResults(
+      last
+        .filter((r) => r.series_id && r.series_title)
+        .map((r) => ({
+          ...r,
+          url: `${SEARCH_SITE}/detail?series_id=${r.series_id}`,
+        }))
+    );
 
     console.log(`[${label}] 命中 ${results.length} 部`);
     return { success: true, results, meta };
@@ -1457,7 +1518,8 @@ function douyinCollectionList() {
         const dir = path.join(base, name);
         let names = [];
         try { names = fs.readdirSync(dir); } catch (_) {}
-        const count = names.filter((n) => /\.mp4$/i.test(n) && !n.includes('合集')).length;
+        // 只排除合并产物 xxx_合集.mp4，别误伤标题里带「合集」二字的正片
+        const count = names.filter((n) => /\.mp4$/i.test(n) && !/_合集\.mp4$/i.test(n)).length;
         if (!count) continue;
         const title = `【抖音】${name}`;
         if (registered.has(title)) continue;
@@ -1798,7 +1860,8 @@ function collectSeriesEpisodeFiles(seriesId, seriesTitle) {
     let names = [];
     try { names = fs.readdirSync(dir); } catch (_) {}
     for (const n of names) {
-      if (!/\.mp4$/i.test(n) || n.includes('合集')) continue;
+      // 只跳过合并产物 xxx_合集.mp4；标题里带「合集」的正片要保留
+      if (!/\.mp4$/i.test(n) || /_合集\.mp4$/i.test(n)) continue;
       // 红果形如「剧名 001.mp4」（集号在末尾）；抖音形如「001 标题.mp4」（序号在前）
       const m = n.match(/(\d{1,4})\.mp4$/i) || n.match(/^(\d{1,4})[ ._-]/);
       if (!m) continue;
@@ -3864,8 +3927,10 @@ function shareRoot() {
   return (settings.root && String(settings.root).trim()) ? String(settings.root).trim() : app.getPath('downloads');
 }
 
-/** 列出可共享的视频（只扫 抖音 / 红果短剧 两个目录，最多 3 层） */
-function listShareFiles() {
+/** 列出可共享的视频（只扫 抖音 / 红果短剧 两个目录，最多 3 层）
+ *  options.raw = true 时不套用「只显示整部」过滤（统计用） */
+function listShareFiles(options) {
+  const raw = !!(options && options.raw);
   const root = shareRoot();
   const out = [];
   const walk = (dir, depth) => {
@@ -3878,14 +3943,40 @@ function listShareFiles() {
       try { st = fs.statSync(full); } catch (_) { continue; }
       if (st.isDirectory()) { walk(full, depth + 1); continue; }
       if (!LAN_MIME[path.extname(n).toLowerCase()]) continue;
+      if (/\.(tmp|part)$/i.test(n)) continue;
       if (st.size < 1024 * 100) continue;
-      out.push({ rel: path.relative(root, full).split(path.sep).join('/'), size: st.size });
+      out.push({
+        rel: path.relative(root, full).split(path.sep).join('/'),
+        size: st.size,
+        // 合并产物（xxx_合集.mp4）单独标记：它就是「整部连播」，排在分组最前
+        merged: /_合集\.mp4$/i.test(n),
+      });
     }
   };
   walk(path.join(root, '抖音'), 0);
   walk(path.join(root, '红果短剧'), 0);
-  out.sort((a, b) => a.rel.localeCompare(b.rel, 'zh-Hans-CN'));
-  return out;
+  out.sort((a, b) => {
+    // 同一分组里，合并产物排最前，其余按文件名（即集号）
+    const ga = shareGroup(a.rel);
+    const gb = shareGroup(b.rel);
+    if (ga !== gb) return a.rel.localeCompare(b.rel, 'zh-Hans-CN');
+    const ma = a.merged ? 0 : 1;
+    const mb = b.merged ? 0 : 1;
+    if (ma !== mb) return ma - mb;
+    return a.rel.localeCompare(b.rel, 'zh-Hans-CN');
+  });
+
+  if (raw) return out;
+
+  // 「只显示整部」：仅对确实存在合并文件的分组生效，否则保持原样
+  const mergedOnly = lanMergedOnlySet();
+  if (!mergedOnly.size) return out;
+  const groupsWithMerged = new Set(out.filter((f) => f.merged).map((f) => shareGroup(f.rel)));
+  return out.filter((f) => {
+    const g = shareGroup(f.rel);
+    if (!mergedOnly.has(g) || !groupsWithMerged.has(g)) return true;
+    return !!f.merged;
+  });
 }
 
 /** 频道所属分组 = 合集/剧名（抖音/<合集>/x.mp4 或 红果短剧/<剧名>/x.mp4） */
@@ -3897,7 +3988,9 @@ function shareGroup(rel) {
 }
 
 /** 列表里显示的名字（去掉分组前缀，分组交给 group-title） */
-function shareChannelName(rel) {
+function shareChannelName(rel, merged) {
+  // 合并产物：给个显眼的固定名，一眼就知道是整部连播
+  if (merged || /_合集\.mp4$/i.test(String(rel))) return '▶ 整部连播';
   return path.basename(rel, path.extname(rel));
 }
 
@@ -3905,12 +3998,39 @@ function shareUrl(host, rel) {
   return `${host}/files/${rel.split('/').map(encodeURIComponent).join('/')}`;
 }
 
+/** 用户在设置里勾了「只显示整部」的剧（按分组名存） */
+function lanMergedOnlySet() {
+  const raw = getCurrentSettings().lan_share_merged_only;
+  return new Set(Array.isArray(raw) ? raw.map(String) : []);
+}
+
+/** 每个分组的统计：单集数 / 整部数 / 是否勾了只显示整部 */
+function shareGroupsSummary() {
+  const files = listShareFiles({ raw: true });
+  const map = new Map();
+  for (const f of files) {
+    const g = shareGroup(f.rel);
+    if (!map.has(g)) map.set(g, { name: g, total: 0, episodes: 0, merged: 0 });
+    const row = map.get(g);
+    row.total += 1;
+    if (f.merged) row.merged += 1;
+    else row.episodes += 1;
+  }
+  const mergedOnly = lanMergedOnlySet();
+  return [...map.values()].map((row) => ({
+    ...row,
+    hasMerged: row.merged > 0,
+    // 没有合并文件的剧不允许开启（开了分组就空了）
+    mergedOnly: mergedOnly.has(row.name) && row.merged > 0,
+  }));
+}
+
 /** M3U：带 group-title，电视端会按合集名分类显示 */
 function m3uBody(host) {
   const lines = ['#EXTM3U'];
   for (const f of listShareFiles()) {
     const group = shareGroup(f.rel);
-    const name = shareChannelName(f.rel);
+    const name = shareChannelName(f.rel, f.merged);
     lines.push(`#EXTINF:-1 group-title="${group}",${name}`);
     lines.push(shareUrl(host, f.rel));
   }
@@ -3928,7 +4048,7 @@ function txtBody(host) {
       lines.push('');
       lines.push(`${group},#genre#`);
     }
-    lines.push(`${shareChannelName(f.rel)},${shareUrl(host, f.rel)}`);
+    lines.push(`${shareChannelName(f.rel, f.merged)},${shareUrl(host, f.rel)}`);
   }
   return lines.join('\n').trim() + '\n';
 }
@@ -3947,7 +4067,7 @@ function shareIndexHtml(host, port) {
     body += `<h2>${group} <span class="c">${list.length}</span></h2><ul>\n`;
     for (const f of list) {
       const size = (f.size / 1048576).toFixed(1) + ' MB';
-      body += `<li><a href="${shareUrl('', f.rel)}">${shareChannelName(f.rel)}</a> <span class="s">${size}</span></li>\n`;
+      body += `<li><a href="${shareUrl('', f.rel)}">${shareChannelName(f.rel, f.merged)}</a> <span class="s">${size}</span></li>\n`;
     }
     body += '</ul>\n';
   }
@@ -4122,6 +4242,33 @@ ipcMain.handle('lan-share-stop', async () => {
 ipcMain.handle('lan-share-status', async () => {
   const info = lanUrls();
   return { success: true, running: !!lanServer, ...info, count: lanServer ? listShareFiles().length : 0 };
+});
+
+/** 共享分组列表（每部剧：单集数 / 是否有整部 / 是否只显示整部） */
+ipcMain.handle('lan-share-groups', async () => {
+  try {
+    return { success: true, groups: shareGroupsSummary() };
+  } catch (error) {
+    return { success: false, error: error.message, groups: [] };
+  }
+});
+
+/** 切换某部剧「只显示整部」 */
+ipcMain.handle('lan-share-set-merged-only', async (event, group, enabled) => {
+  try {
+    const name = String(group || '').trim();
+    if (!name) return { success: false, error: '缺少剧名' };
+    const settings = getCurrentSettings();
+    const set = new Set(Array.isArray(settings.lan_share_merged_only) ? settings.lan_share_merged_only.map(String) : []);
+    if (enabled) set.add(name);
+    else set.delete(name);
+    const merged = { ...getDefaultSettings(), ...settings, lan_share_merged_only: [...set] };
+    store.saveSettings(merged);
+    console.log('[LAN] 只显示整部:', name, enabled ? '开' : '关');
+    return { success: true, groups: shareGroupsSummary() };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
 });
 
 app.whenReady().then(async () => {

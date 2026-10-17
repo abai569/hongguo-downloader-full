@@ -10,6 +10,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // 局域网共享（电视 / 手机播放已下载视频）
   lanShareStart: () => ipcRenderer.invoke('lan-share-start'),
   lanShareStop: () => ipcRenderer.invoke('lan-share-stop'),
+  lanShareGroups: () => ipcRenderer.invoke('lan-share-groups'),
+  lanShareSetMergedOnly: (group, enabled) => ipcRenderer.invoke('lan-share-set-merged-only', group, enabled),
   lanShareStatus: () => ipcRenderer.invoke('lan-share-status'),
 
 
