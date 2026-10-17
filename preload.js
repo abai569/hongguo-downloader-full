@@ -10,6 +10,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
   hongguoResolve: (input) => ipcRenderer.invoke('hongguo-resolve', input),
   hongguoDownloadBatch: (payload) => ipcRenderer.invoke('hongguo-download-batch', payload),
 
+  // 抖音合集解析与下载
+  douyinResolveCollection: (input) => ipcRenderer.invoke('douyin-resolve-collection', input),
+  douyinDownloadCollection: (payload) => ipcRenderer.invoke('douyin-download-collection', payload),
+  openDouyinLog: () => ipcRenderer.invoke('open-douyin-log'),
+  onDouyinParseProgress: (cb) => {
+    const listener = (_e, data) => cb(data);
+    ipcRenderer.on('douyin-parse-progress', listener);
+    return () => ipcRenderer.removeListener('douyin-parse-progress', listener);
+  },
+
   // 搜索（内嵌浏览器嗅探）
   searchSeries: (keyword) => ipcRenderer.invoke('search-series', keyword),
   searchResolve: (seriesId) => ipcRenderer.invoke('search-resolve', seriesId),

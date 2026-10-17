@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { Film, Download, Settings, Play, Sparkles } from './components/icons';
+import { Film, Download, Settings, Play, Sparkles, Music } from './components/icons';
 import HongguoDownload from './components/HongguoDownload';
+import DouyinDownload from './components/DouyinDownload';
 import DownloadManager from './components/DownloadManager';
 import SettingsPage from './components/Settings';
 import Player from './components/Player';
@@ -9,6 +10,7 @@ import Browse from './components/Browse';
 const MENU = [
   { id: 'browse', label: '浏览', icon: Sparkles },
   { id: 'download', label: '红果下载', icon: Film },
+  { id: 'douyin', label: '抖音下载', icon: Music },
   { id: 'player', label: '播放', icon: Play },
   { id: 'manager', label: '下载管理', icon: Download },
   { id: 'settings', label: '设置', icon: Settings },
@@ -46,6 +48,9 @@ export default function App() {
       case 'settings':
         return <SettingsPage />;
       case 'download':
+        return <HongguoDownload onNavigate={setPage} />;
+      case 'douyin':
+        return <DouyinDownload onNavigate={setPage} />;
       default:
         return <HongguoDownload onNavigate={setPage} />;
     }

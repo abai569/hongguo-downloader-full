@@ -24,7 +24,9 @@ function sortTasks(list) {
     const wb = STATUS_ORDER[b.status] ?? 99;
     if (wa !== wb) return wa - wb;
     if (wa <= 1) {
-      return (a.hongguoInfo?.vid_index || 0) - (b.hongguoInfo?.vid_index || 0) || (a.startTime || 0) - (b.startTime || 0);
+      const ia = a.hongguoInfo?.vid_index || a.douyinInfo?.index || 0;
+      const ib = b.hongguoInfo?.vid_index || b.douyinInfo?.index || 0;
+      return ia - ib || (a.startTime || 0) - (b.startTime || 0);
     }
     return (b.endTime || b.startTime || 0) - (a.endTime || a.startTime || 0);
   });
@@ -583,7 +585,7 @@ function DownloadManager({ onNavigate }) {
                     className="icon-btn icon-btn-danger"
                     title="删除任务（可选是否同时删除本地文件）"
                     onClick={() => {
-                      askDelete([task], `删除《${task.hongguoInfo && task.hongguoInfo.series_title ? task.hongguoInfo.series_title : ''}》第 ${task.hongguoInfo ? task.hongguoInfo.vid_index : ''} 集任务`);
+                      askDelete([task], `删除任务：${task.title || ''}`);
                     }}
                   >
                     <Trash2 size={16} />

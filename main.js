@@ -15,6 +15,7 @@ const fsp = require('fs/promises');
 const axios = require('axios');
 
 const hongguo = require('./src/native/hongguo');
+const douyin = require('./src/native/douyin');
 const store = require('./src/store');
 const APP_VERSION = app.getVersion() || '1.0.0';
 
@@ -115,6 +116,8 @@ function getDefaultSettings() {
     auto_delete_watched: false,
     // 兼容模式：本机无法解码 HEVC 时自动转码为 H.264（解决「黑屏有声」）
     compat_mode: true,
+    // 抖音合集解析时显示窗口：默认隐藏，触发风控页时打开可用于手动过验证
+    douyin_parse_window: false,
     // ===== 网络代理 =====
     // proxy_enabled: 是否启用代理（关闭时忽略系统代理，直连）
     // proxy_mode:    system=跟随系统/环境变量 · custom=手动指定 · direct=强制直连
@@ -479,6 +482,10 @@ async function executeDownload(task) {
     await executeHongguoDownload(task);
     return;
   }
+  if (task.type === 'douyin') {
+    await executeDouyinDownload(task);
+    return;
+  }
   throw new Error('未知任务类型: ' + task.type);
 }
 
@@ -565,8 +572,8 @@ function cleanupStaleTempFiles() {
   } catch (_) {
     return 0;
   }
-  const base = path.join(root, '红果短剧');
-  if (!fs.existsSync(base)) return 0;
+  const bases = [path.join(root, '红果短剧'), path.join(root, '抖音')].filter((p) => fs.existsSync(p));
+  if (!bases.length) return 0;
 
   let removed = 0;
   const walk = (dir, depth) => {
@@ -577,12 +584,12 @@ function cleanupStaleTempFiles() {
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) {
         walk(full, depth + 1);
-      } else if (entry.name.endsWith('.enc.tmp')) {
+      } else if (entry.name.endsWith('.enc.tmp') || entry.name.endsWith('.tmp')) {
         try { fs.unlinkSync(full); removed++; } catch (_) {}
       }
     }
   };
-  walk(base, 0);
+  for (const base of bases) walk(base, 0);
   if (removed > 0) console.log(`[Hongguo] 启动清理：删除 ${removed} 个残留临时文件`);
   return removed;
 }
@@ -636,8 +643,10 @@ async function executeHongguoDownload(task) {
 
 function markTaskStopped(task) {
   if (task.savePath) {
-    const tmp = task.savePath + '.enc.tmp';
-    if (fs.existsSync(tmp)) { try { fs.unlinkSync(tmp); } catch (_) {} }
+    for (const suffix of ['.enc.tmp', '.tmp']) {
+      const tmp = task.savePath + suffix;
+      if (fs.existsSync(tmp)) { try { fs.unlinkSync(tmp); } catch (_) {} }
+    }
   }
   task.status = 'stopped';
   task.endTime = Date.now();
@@ -823,6 +832,208 @@ async function downloadHongguoEpisode(task, attempt) {
   saveDownloadTasks();
 
   console.log('[Hongguo] 下载完成:', finalPath);
+  sendToRenderer('download-completed', { id, path: finalPath });
+}
+
+// ===== 抖音作品下载 =====
+// 抖音直链是普通明文 MP4（无水印地址由 play 域提供），没有 CENC 解密环节，
+// 但仍沿用红果那套看门狗 + 自动重试：直链有时效，重试必须重新解析。
+async function executeDouyinDownload(task) {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= DOWNLOAD_MAX_ATTEMPTS; attempt++) {
+    if (task.cancelled) {
+      markTaskStopped(task);
+      return;
+    }
+    try {
+      await downloadDouyinVideo(task, attempt);
+      return;
+    } catch (error) {
+      lastError = error;
+      delete task.cancelSource;
+      delete task.writer;
+      if (task.cancelled) {
+        markTaskStopped(task);
+        return;
+      }
+      const message = error && error.filePath
+        ? describeFileError(error, error.filePath)
+        : ((error && error.message) || String(error));
+      const info = task.douyinInfo || {};
+      console.warn(`[Douyin] ${info.mix_name || ''} 第${info.index || ''}条 第 ${attempt}/${DOWNLOAD_MAX_ATTEMPTS} 次失败: ${message}`);
+      douyin.log(`[download] ${info.mix_name || ''} #${info.index || ''} 第${attempt}次失败: ${message}`);
+      if (attempt < DOWNLOAD_MAX_ATTEMPTS) {
+        task.error = `第 ${attempt} 次失败（${message}），正在自动重试…`;
+        sendToRenderer('download-progress', {
+          id: task.id,
+          progress: task.progress || 0,
+          receivedBytes: task.receivedBytes || 0,
+          totalBytes: task.totalBytes || 0,
+          message: task.error,
+        });
+        await delay(1200 * attempt);
+      }
+    }
+  }
+
+  const reason = (lastError && lastError.message) || '未知错误';
+  task.status = 'failed';
+  task.error = `已自动重试 ${DOWNLOAD_MAX_ATTEMPTS} 次仍失败：${reason}`;
+  task.endTime = Date.now();
+  saveDownloadTasks();
+  console.error('[Douyin] 放弃下载:', reason);
+  douyin.log('[download] 放弃: ' + reason);
+  sendToRenderer('download-failed', { id: task.id, error: task.error });
+}
+
+async function downloadDouyinVideo(task, attempt) {
+  const { id, douyinInfo, filename } = task;
+  const info = douyinInfo || {};
+
+  task.status = 'downloading';
+  task.progress = 0;
+  task.receivedBytes = 0;
+  task.totalBytes = 0;
+  task.error = '';
+  sendToRenderer('download-progress', { id, progress: 0, receivedBytes: 0, totalBytes: 0, message: '' });
+
+  // 直链带签名且有时效，每次尝试都重新解析
+  const play = await douyin.resolvePlayUrl(info.aweme_id);
+  if (!play || !play.url) {
+    throw new Error('未获取到无水印直链');
+  }
+
+  const settings = getCurrentSettings();
+  const root = (settings.root && String(settings.root).trim()) ? String(settings.root).trim() : app.getPath('downloads');
+  const mixFolder = sanitizeFolderName(info.mix_name) || '抖音合集';
+  const downloadDir = task.customDir || path.join(root, '抖音', mixFolder);
+  fs.mkdirSync(downloadDir, { recursive: true });
+
+  const finalPath = task.savePath || path.join(downloadDir, filename);
+  task.savePath = finalPath;
+
+  if (fs.existsSync(finalPath)) {
+    let existing = null;
+    try { existing = fs.statSync(finalPath); } catch (_) {}
+    if (existing && existing.isDirectory()) {
+      throw new Error(`目标位置被同名文件夹占用，请删除或重命名该文件夹后重试（${finalPath}）`);
+    }
+    if (existing && existing.size > 1024 * 100) {
+      console.log('[Douyin] 文件已存在，直接完成:', finalPath);
+      task.status = 'completed';
+      task.progress = 100;
+      task.error = '';
+      task.endTime = Date.now();
+      saveDownloadTasks();
+      sendToRenderer('download-completed', { id, path: finalPath });
+      return;
+    }
+    prepareWritablePath(finalPath, '目标文件');
+  }
+
+  const tmpPath = resolveUsableTmpPath(finalPath + '.tmp');
+
+  const CancelToken = axios.CancelToken;
+  const source = CancelToken.source();
+  task.cancelSource = source;
+
+  const response = await axios({
+    method: 'GET',
+    url: play.url,
+    responseType: 'stream',
+    headers: {
+      'User-Agent': douyin.UA,
+      Referer: play.referer || douyin.REFERER,
+    },
+    timeout: 60000,
+    maxRedirects: 5,
+    cancelToken: source.token,
+  });
+
+  const totalLength = parseInt(response.headers['content-length'], 10) || 0;
+  task.totalBytes = totalLength;
+
+  const writer = fs.createWriteStream(tmpPath);
+  writer.on('error', (err) => { if (err && !err.filePath) err.filePath = tmpPath; });
+  task.writer = writer;
+
+  let received = 0;
+  let stalled = false;
+  let idleTimer = null;
+  const clearIdle = () => { if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; } };
+  const armIdle = () => {
+    clearIdle();
+    idleTimer = setTimeout(() => {
+      stalled = true;
+      console.warn(`[Douyin] 下载卡死（${DOWNLOAD_IDLE_TIMEOUT_MS / 1000} 秒无数据），中断后自动重试:`, finalPath);
+      if (task.cancelSource) {
+        try { task.cancelSource.cancel('下载卡死'); } catch (_) {}
+      }
+      try { response.data.destroy(new Error('下载卡死')); } catch (_) {}
+      try { writer.destroy(); } catch (_) {}
+    }, DOWNLOAD_IDLE_TIMEOUT_MS);
+  };
+
+  armIdle();
+  response.data.on('data', (chunk) => {
+    received += chunk.length;
+    task.receivedBytes = received;
+    const progress = totalLength ? Math.floor((received / totalLength) * 100) : 0;
+    task.progress = progress;
+    sendToRenderer('download-progress', { id, progress, receivedBytes: received, totalBytes: totalLength });
+    armIdle();
+  });
+
+  response.data.pipe(writer);
+
+  let failed = false;
+  try {
+    await new Promise((resolve, reject) => {
+      writer.on('finish', resolve);
+      writer.on('error', reject);
+      writer.on('close', () => { if (stalled) reject(new Error('下载卡死')); });
+      response.data.on('error', reject);
+    });
+  } catch (err) {
+    failed = true;
+    throw err;
+  } finally {
+    clearIdle();
+    delete task.cancelSource;
+    delete task.writer;
+    try { response.data.destroy(); } catch (_) {}
+    try { writer.destroy(); } catch (_) {}
+    if (failed) {
+      try { fs.unlinkSync(tmpPath); } catch (_) {}
+    }
+  }
+
+  if (task.cancelled) throw new Error('任务已取消');
+  if (stalled) throw new Error(`下载卡死（${DOWNLOAD_IDLE_TIMEOUT_MS / 1000} 秒无数据）`);
+  if (totalLength > 0 && received < totalLength) {
+    throw new Error(`下载不完整（${received}/${totalLength} 字节）`);
+  }
+  if (received < 1024) {
+    throw new Error('下载内容异常（文件过小，可能是风控页）');
+  }
+
+  try {
+    prepareWritablePath(finalPath, '目标文件');
+    fs.renameSync(tmpPath, finalPath);
+  } catch (err) {
+    if (err && !err.filePath) err.filePath = finalPath;
+    throw err;
+  }
+
+  task.status = 'completed';
+  task.progress = 100;
+  task.error = '';
+  task.endTime = Date.now();
+  saveDownloadTasks();
+
+  console.log('[Douyin] 下载完成:', finalPath);
+  douyin.log('[download] 完成: ' + finalPath);
   sendToRenderer('download-completed', { id, path: finalPath });
 }
 
@@ -1125,7 +1336,30 @@ ipcMain.handle('search-window-show', async (event, visible) => {
 });
 
 // 已登记的短剧档案（不含被用户移除的）
-ipcMain.handle('get-series-list', async () => visibleSeries());
+ipcMain.handle('get-series-list', async () => [...visibleSeries(), ...douyinCollectionList()]);
+
+/** 已下载的抖音合集，伪造成 series 条目供「一键合并」下拉框复用 */
+function douyinCollectionList() {
+  const groups = new Map();
+  for (const task of downloadTasks) {
+    if (!task.douyinInfo) continue;
+    const mixId = String(task.douyinInfo.mix_id || '');
+    if (!mixId) continue;
+    const key = 'douyin:' + mixId;
+    const prev = groups.get(key);
+    if (prev) {
+      prev.count += 1;
+    } else {
+      groups.set(key, {
+        series_id: key,
+        series_title: `【抖音】${task.douyinInfo.mix_name || mixId}`,
+        douyin: true,
+        count: 1,
+      });
+    }
+  }
+  return [...groups.values()];
+}
 
 /** 从列表移除一部短剧（只取消登记，不删本地文件） */
 ipcMain.handle('remove-series', async (event, seriesId) => {
@@ -1368,13 +1602,34 @@ ipcMain.handle('show-in-folder', async (event, filePath) => {
 
 ipcMain.handle('get-merge-tasks', async () => mergeTasks.map(({ child, ...rest }) => rest));
 
-/** 找到某剧在磁盘上的目录（优先用任务记录，其次按标题推导） */
+/** 任务所属的合集键：红果用 series_id，抖音用 douyin:<mix_id>，合并逻辑对两者一视同仁 */
+function taskCollectionKey(task) {
+  if (!task) return '';
+  if (task.hongguoInfo) return String(task.hongguoInfo.series_id);
+  if (task.douyinInfo) return 'douyin:' + String(task.douyinInfo.mix_id);
+  return '';
+}
+
+/** 任务在合集内的序号：红果是 vid_index，抖音是 index */
+function taskEpisodeIndex(task) {
+  if (!task) return 0;
+  if (task.hongguoInfo) return Number(task.hongguoInfo.vid_index) || 0;
+  if (task.douyinInfo) return Number(task.douyinInfo.index) || 0;
+  return 0;
+}
+
+function isDouyinKey(key) {
+  return String(key || '').startsWith('douyin:');
+}
+
+/** 找到某合集在磁盘上的目录（优先用任务记录，其次按标题推导） */
 function resolveSeriesDir(seriesId, seriesTitle, covers) {
   const fromTask = covers.find((t) => t.customDir && fs.existsSync(t.customDir));
   if (fromTask) return fromTask.customDir;
   const settings = getCurrentSettings();
   const root = (settings.root && String(settings.root).trim()) ? String(settings.root).trim() : app.getPath('downloads');
-  const guess = path.join(root, '红果短剧', sanitizeFolderName(seriesTitle) || '未命名短剧');
+  const parent = isDouyinKey(seriesId) ? '抖音' : '红果短剧';
+  const guess = path.join(root, parent, sanitizeFolderName(seriesTitle) || (isDouyinKey(seriesId) ? '抖音合集' : '未命名短剧'));
   return fs.existsSync(guess) ? guess : null;
 }
 
@@ -1385,9 +1640,7 @@ function resolveSeriesDir(seriesId, seriesTitle, covers) {
  */
 function collectSeriesEpisodeFiles(seriesId, seriesTitle) {
   const sid = String(seriesId);
-  const tasks = downloadTasks.filter(
-    (t) => t.hongguoInfo && String(t.hongguoInfo.series_id) === sid && t.savePath
-  );
+  const tasks = downloadTasks.filter((t) => taskCollectionKey(t) === sid && t.savePath);
   const dir = resolveSeriesDir(sid, seriesTitle, tasks);
 
   const byIndex = new Map();
@@ -1398,7 +1651,7 @@ function collectSeriesEpisodeFiles(seriesId, seriesTitle) {
   // 1) 任务记录优先（命名模板可能与默认不同）
   for (const t of tasks) {
     if (!exists(t.savePath)) continue;
-    const idx = Number(t.hongguoInfo.vid_index) || 0;
+    const idx = taskEpisodeIndex(t);
     if (!idx) continue;
     const prev = byIndex.get(idx);
     if (!prev || (t.startTime || 0) > (prev.startTime || 0)) {
@@ -1414,8 +1667,8 @@ function collectSeriesEpisodeFiles(seriesId, seriesTitle) {
     try { names = fs.readdirSync(dir); } catch (_) {}
     for (const n of names) {
       if (!/\.mp4$/i.test(n) || n.includes('合集')) continue;
-      // 形如「剧名 001.mp4」——取文件名末尾的数字作为集号
-      const m = n.match(/(\d{1,4})\.mp4$/i);
+      // 红果形如「剧名 001.mp4」（集号在末尾）；抖音形如「001 标题.mp4」（序号在前）
+      const m = n.match(/(\d{1,4})\.mp4$/i) || n.match(/^(\d{1,4})[ ._-]/);
       if (!m) continue;
       const idx = parseInt(m[1], 10);
       if (!idx || byIndex.has(idx)) continue;
@@ -1434,10 +1687,14 @@ ipcMain.handle('merge-series', async (event, seriesId, outputName, options) => {
   try {
     const sid = String(seriesId);
     const entry = seriesRegistry.find((s) => String(s.series_id) === sid);
+    const douyinTask = isDouyinKey(sid)
+      ? downloadTasks.find((t) => t.douyinInfo && taskCollectionKey(t) === sid)
+      : null;
     const seriesTitle =
       (entry && entry.series_title) ||
+      (douyinTask && douyinTask.douyinInfo && douyinTask.douyinInfo.mix_name) ||
       ((downloadTasks.find((t) => t.hongguoInfo && String(t.hongguoInfo.series_id) === sid) || {}).hongguoInfo || {}).series_title ||
-      '未命名短剧';
+      (isDouyinKey(sid) ? '抖音合集' : '未命名短剧');
     const entries = (entry && entry.episodes) || [];
 
     const { dir, ordered } = collectSeriesEpisodeFiles(sid, seriesTitle);
@@ -1621,7 +1878,8 @@ ipcMain.handle('merge-series', async (event, seriesId, outputName, options) => {
         }
       } else {
         task.status = 'failed';
-        task.error = `ffmpeg 退出码 ${code}${stderrTail ? '：' + stderrTail.split('\n').filter(Boolean).slice(-2).join(' ') : ''}`;
+        const hint = options && options.compatible ? '' : '；可改用「兼容合并」重试';
+        task.error = `ffmpeg 退出码 ${code}${stderrTail ? '：' + stderrTail.split('\n').filter(Boolean).slice(-2).join(' ') : ''}${hint}`;
         try { fs.existsSync(tmpOutput) && fs.unlinkSync(tmpOutput); } catch (_) {}
       }
       saveMergeTasks();
@@ -2448,6 +2706,133 @@ ipcMain.handle('hongguo-download-batch', async (event, payload) => {
   }
 });
 
+// ===== IPC：抖音合集解析与批量下载 =====
+ipcMain.handle('douyin-resolve-collection', async (event, input) => {
+  try {
+    const settings = getCurrentSettings();
+    const data = await douyin.resolveCollection(input, {
+      showWindow: settings.douyin_parse_window === true,
+      onProgress: (progress) => sendToRenderer('douyin-parse-progress', progress),
+    });
+    douyin.log('[ipc] 解析成功：作品数 ' + data.items.length);
+    return { success: true, data };
+  } catch (error) {
+    douyin.log('[ipc] 解析失败：' + error.message);
+    if (error && error.stack) douyin.log('[ipc] stack: ' + String(error.stack).split('\n').slice(0, 4).join(' | '));
+    console.error('[Douyin] 合集解析失败:', error.message);
+    return { success: false, error: error.message };
+  }
+});
+
+// 打开解析日志（打包版没有终端，排查时用这个文件）
+ipcMain.handle('open-douyin-log', async () => {
+  try {
+    const file = douyin.logPath();
+    if (!file) return { success: false, error: '日志路径不可用' };
+    if (!fs.existsSync(file)) {
+      fs.writeFileSync(file, '', 'utf8');
+    }
+    const result = await shell.openPath(file);
+    if (result) return { success: false, error: result };
+    return { success: true, path: file };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+function enqueueDouyinItems(payload) {
+  const { mixId, mixName, author, items } = payload || {};
+  if (!Array.isArray(items) || !items.length) return 0;
+
+  const settings = getCurrentSettings();
+  const root = (settings.root && String(settings.root).trim()) ? String(settings.root).trim() : app.getPath('downloads');
+  const cleanMix = sanitizeFolderName(mixName) || `合集${String(mixId).slice(-6)}`;
+  const downloadDir = path.join(root, '抖音', cleanMix);
+  let created = 0;
+
+  for (const item of items) {
+    const awemeId = String((item && item.aweme_id) || '').trim();
+    if (!awemeId) continue;
+    if (item.type && item.type !== 'video') continue;
+
+    // 同一作品已在队列/已完成则跳过；已停止的、或已完成但文件已被删的重新入队
+    const dup = downloadTasks.find(
+      (t) => t.douyinInfo && String(t.douyinInfo.aweme_id) === awemeId && t.status !== 'failed'
+    );
+    if (dup) {
+      const fileMissing = dup.status === 'completed'
+        && (!dup.savePath || !fs.existsSync(dup.savePath));
+      if (dup.status === 'stopped' || fileMissing) {
+        dup.status = 'pending';
+        dup.cancelled = false;
+        delete dup.error;
+        if (!downloadQueue.some((t) => t.id === dup.id)) downloadQueue.push(dup);
+        created++;
+      }
+      continue;
+    }
+
+    const index = Number(item.index) || created + 1;
+    const indexStr = String(index).padStart(3, '0');
+    const cleanTitle = sanitizeFolderName(item.title) || `作品${indexStr}`;
+    const filename = `${indexStr} ${cleanTitle.slice(0, 40)}.mp4`;
+    const finalPath = path.join(downloadDir, filename);
+
+    const task = {
+      id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
+      savePath: finalPath,
+      customDir: downloadDir,
+      title: `${indexStr} ${item.title || cleanMix}`.trim(),
+      filename,
+      platform: 'douyin',
+      type: 'douyin',
+      status: 'pending',
+      progress: 0,
+      receivedBytes: 0,
+      totalBytes: 0,
+      startTime: Date.now(),
+      videoInfo: {
+        author: author || '',
+        title: item.title || '',
+        cover: item.cover || '',
+        aweme_id: awemeId,
+      },
+      douyinInfo: {
+        mix_id: String(mixId),
+        mix_name: cleanMix,
+        author: author || '',
+        index,
+        aweme_id: awemeId,
+        title: item.title || '',
+      },
+    };
+
+    downloadTasks.unshift(task);
+    downloadQueue.push(task);
+    sendToRenderer('download-task-added', task);
+    created++;
+  }
+
+  saveDownloadTasks();
+  if (created > 0) {
+    sendToRenderer('download-queue-changed', {});
+    pumpQueue();
+  }
+  return created;
+}
+
+ipcMain.handle('douyin-download-collection', async (event, payload) => {
+  try {
+    const items = (payload && payload.items) || [];
+    if (!items.length) return { success: false, error: '未选择作品' };
+    const count = enqueueDouyinItems(payload);
+    return { success: true, count, requested: items.length };
+  } catch (error) {
+    console.error('[Douyin] 提交下载失败:', error.message);
+    return { success: false, error: error.message };
+  }
+});
+
 // 播放器里「下载本集」：按 series_id + vid_index 补单集
 ipcMain.handle('download-single-episode', async (event, seriesId, vidIndex) => {
   try {
@@ -2584,7 +2969,7 @@ ipcMain.handle('get-download-tasks', () => {
 function removeTaskFile(task) {
   if (!task || !task.savePath) return 0;
   let freed = 0;
-  for (const p of [task.savePath, task.savePath + '.enc.tmp']) {
+  for (const p of [task.savePath, task.savePath + '.enc.tmp', task.savePath + '.tmp']) {
     try {
       if (fs.existsSync(p)) {
         const st = fs.statSync(p);

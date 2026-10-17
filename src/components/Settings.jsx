@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import './Settings.css';
-import { Settings, Folder, Check, Globe, X, RefreshCw, AlertCircle } from './icons';
+import { Settings, Folder, Check, Globe, X, RefreshCw, AlertCircle, ExternalLink } from './icons';
 
 
 const FORMAT_PRESETS = [
@@ -204,6 +204,37 @@ function SettingsPage() {
           <p className="settings-hint">
             托盘图标在任务栏右下角通知区域，若没看到请点「显示隐藏的图标」。保存后立即生效。
           </p>
+        </div>
+
+        <div className="settings-group">
+          <label className="settings-label">抖音</label>
+          <label className="proxy-switch-row">
+            <input
+              type="checkbox"
+              checked={settings.douyin_parse_window === true}
+              onChange={(e) => update('douyin_parse_window', e.target.checked)}
+            />
+            <span className="proxy-switch-text">
+              解析合集时显示窗口
+              <em>默认隐藏。遇到风控验证页时打开，可手动完成验证后再解析</em>
+            </span>
+          </label>
+          <p className="settings-hint">
+            合集解析会在后台打开抖音页面滚动加载，通常 3–15 秒；保存后立即生效。
+          </p>
+          <div className="proxy-status-row">
+            <button
+              className="btn btn-outline btn-sm"
+              onClick={async () => {
+                const res = await window.electronAPI.openDouyinLog();
+                if (res && !res.success) window.alert(res.error || '打开日志失败');
+              }}
+              title="解析失败时把该文件发给开发者，可快速定位问题"
+            >
+              <ExternalLink size={14} />
+              打开解析日志
+            </button>
+          </div>
         </div>
 
         <div className="settings-group">
