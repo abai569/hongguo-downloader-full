@@ -3888,36 +3888,77 @@ function listShareFiles() {
   return out;
 }
 
-function shareTitle(rel) {
+/** 频道所属分组 = 合集/剧名（抖音/<合集>/x.mp4 或 红果短剧/<剧名>/x.mp4） */
+function shareGroup(rel) {
   const parts = String(rel).split('/');
-  const series = parts.length > 1 ? parts[parts.length - 2] : '';
-  const name = path.basename(rel, path.extname(rel));
-  // 文件名里通常已经带序号，拼上合集名便于在电视上认
-  return [series, name].filter(Boolean).join(' ');
+  if (parts.length >= 3) return parts[parts.length - 2];
+  if (parts.length === 2) return parts[0];
+  return '未分类';
 }
 
+/** 列表里显示的名字（去掉分组前缀，分组交给 group-title） */
+function shareChannelName(rel) {
+  return path.basename(rel, path.extname(rel));
+}
+
+function shareUrl(host, rel) {
+  return `${host}/files/${rel.split('/').map(encodeURIComponent).join('/')}`;
+}
+
+/** M3U：带 group-title，电视端会按合集名分类显示 */
 function m3uBody(host) {
   const lines = ['#EXTM3U'];
   for (const f of listShareFiles()) {
-    lines.push(`#EXTINF:-1,${shareTitle(f.rel)}`);
-    lines.push(`${host}/files/${f.rel.split('/').map(encodeURIComponent).join('/')}`);
+    const group = shareGroup(f.rel);
+    const name = shareChannelName(f.rel);
+    lines.push(`#EXTINF:-1 group-title="${group}",${name}`);
+    lines.push(shareUrl(host, f.rel));
   }
   return lines.join('\n') + '\n';
 }
 
+/** TVBox / FongMi 的 txt 源格式：「分组名,#genre#」+「频道名,地址」 */
+function txtBody(host) {
+  const lines = [];
+  let current = '';
+  for (const f of listShareFiles()) {
+    const group = shareGroup(f.rel);
+    if (group !== current) {
+      current = group;
+      lines.push('');
+      lines.push(`${group},#genre#`);
+    }
+    lines.push(`${shareChannelName(f.rel)},${shareUrl(host, f.rel)}`);
+  }
+  return lines.join('\n').trim() + '\n';
+}
+
 function shareIndexHtml(host, port) {
   const files = listShareFiles();
-  const rows = files.map((f) => {
-    const url = `/files/${f.rel.split('/').map(encodeURIComponent).join('/')}`;
-    const size = (f.size / 1048576).toFixed(1) + ' MB';
-    return `<li><a href="${url}">${shareTitle(f.rel)}</a> <span class="s">${size}</span></li>`;
-  }).join('\n');
+  // 目录页也按合集分组，层次清楚一些
+  const groups = new Map();
+  for (const f of files) {
+    const g = shareGroup(f.rel);
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push(f);
+  }
+  let body = '';
+  for (const [group, list] of groups) {
+    body += `<h2>${group} <span class="c">${list.length}</span></h2><ul>\n`;
+    for (const f of list) {
+      const size = (f.size / 1048576).toFixed(1) + ' MB';
+      body += `<li><a href="${shareUrl('', f.rel)}">${shareChannelName(f.rel)}</a> <span class="s">${size}</span></li>\n`;
+    }
+    body += '</ul>\n';
+  }
   return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>果抖下载器 · 局域网共享</title>
 <style>
 body{font-family:system-ui,sans-serif;background:#14161c;color:#e6e9ef;margin:0;padding:24px}
 h1{font-size:20px;margin:0 0 6px}
+h2{font-size:15px;margin:22px 0 6px;color:#fff}
+h2 .c{font-size:12px;color:#5c6375;font-weight:400;margin-left:6px}
 p{color:#8a93a8;font-size:13px;margin:0 0 16px}
 code{background:#23262f;padding:2px 6px;border-radius:4px;color:#ff8fa3}
 a{color:#7cc4ff;text-decoration:none}
@@ -3925,11 +3966,9 @@ li{margin:8px 0;line-height:1.5}
 .s{color:#5c6375;font-size:12px;margin-left:8px}
 </style></head><body>
 <h1>果抖下载器 · 局域网共享</h1>
-<p>共 ${files.length} 个视频 · 播放列表：<code>${host}/playlist.m3u</code></p>
-<p>电视端：OK影视 → 设置 → 直播 → 直播源，填上面这个播放列表地址。</p>
-<ul>
-${rows}
-</ul>
+<p>共 ${files.length} 个视频 · 播放列表（按合集分组）：<code>${host}/playlist.m3u</code></p>
+<p>电视端：OK影视 → 设置 → 直播 → 直播源，填上面这个播放列表地址；也可以在直播页里按分组浏览。</p>
+${body}
 </body></html>`;
 }
 
@@ -3986,7 +4025,7 @@ function lanUrls() {
   if (!urls.length) urls.push(`http://127.0.0.1:${lanPort}`);
   // 以太网/Wi-Fi 优先（WSL 的 172.x 虚拟网卡排后面）
   urls.sort((a, b) => (a.includes('172.23.') ? 1 : 0) - (b.includes('172.23.') ? 1 : 0));
-  return { port: lanPort, urls, m3u: urls[0] + '/playlist.m3u', web: urls[0] + '/' };
+  return { port: lanPort, urls, m3u: urls[0] + '/playlist.m3u', txt: urls[0] + '/playlist.txt', web: urls[0] + '/' };
 }
 
 function stopLanShare() {
@@ -4010,9 +4049,15 @@ function startLanShare(preferredPort) {
           res.end(shareIndexHtml(host, lanPort));
           return;
         }
-        if (parsed.pathname === '/playlist.m3u' || parsed.pathname === '/playlist.txt') {
+        if (parsed.pathname === '/playlist.m3u') {
           res.writeHead(200, { 'Content-Type': 'audio/x-mpegurl; charset=utf-8', 'Cache-Control': 'no-cache' });
           res.end(m3uBody(host));
+          return;
+        }
+        if (parsed.pathname === '/playlist.txt') {
+          // TVBox / FongMi 的 txt 源格式（带 #genre# 分组）
+          res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-cache' });
+          res.end(txtBody(host));
           return;
         }
         const m = parsed.pathname.match(/^\/files\/(.+)$/);

@@ -50,7 +50,7 @@ function SettingsPage() {
   const [testing, setTesting] = useState(false);
   const [logPath, setLogPath] = useState('');
   const [login, setLogin] = useState(null);
-  const [lan, setLan] = useState({ running: false, m3u: '', web: '', count: 0 });
+  const [lan, setLan] = useState({ running: false, m3u: '', txt: '', web: '', count: 0 });
   const [lanBusy, setLanBusy] = useState(false);
   const [copiedKey, setCopiedKey] = useState('');
 
@@ -66,7 +66,7 @@ function SettingsPage() {
     if (!window.electronAPI.lanShareStatus) return;
     try {
       const res = await window.electronAPI.lanShareStatus();
-      if (res) setLan({ running: !!res.running, m3u: res.m3u || '', web: res.web || '', count: res.count || 0 });
+      if (res) setLan({ running: !!res.running, m3u: res.m3u || '', txt: res.txt || '', web: res.web || '', count: res.count || 0 });
     } catch (_) {}
   };
 
@@ -78,7 +78,7 @@ function SettingsPage() {
         ? await window.electronAPI.lanShareStart()
         : await window.electronAPI.lanShareStop();
       if (res && res.success) {
-        setLan({ running: !!enabled, m3u: res.m3u || '', web: res.web || '', count: res.count || 0 });
+        setLan({ running: !!enabled, m3u: res.m3u || '', txt: res.txt || '', web: res.web || '', count: res.count || 0 });
       } else {
         window.alert((res && res.error) || '局域网共享启动失败（端口可能被占用）');
         await refreshLan();
@@ -111,6 +111,13 @@ function SettingsPage() {
     refreshLogin();
     refreshLan();
   }, []);
+
+  // 共享开着时定时刷新状态：新下载完成的视频数能实时反映出来
+  useEffect(() => {
+    if (!lan.running) return undefined;
+    const timer = setInterval(() => { refreshLan(); }, 8000);
+    return () => clearInterval(timer);
+  }, [lan.running]);
 
   const update = (key, value) => {
     setSettings((prev) => ({ ...prev, [key]: value }));
@@ -367,11 +374,16 @@ function SettingsPage() {
           <div className="proxy-status-row">
             <span className={`proxy-dot ${lan.running ? 'proxy-dot-on' : 'proxy-dot-off'}`} />
             <span className="proxy-status-text">
-              {lan.running ? `运行中 · 共 ${lan.count} 个视频` : '未开启'}
+              {lan.running ? `运行中 · 共 ${lan.count} 个视频（每 8 秒自动刷新）` : '未开启'}
             </span>
             {lan.running && (
               <button className="btn btn-outline btn-sm" onClick={() => copyTo(lan.m3u, 'm3u')}>
-                {copiedKey === 'm3u' ? '已复制' : '复制播放列表地址'}
+                {copiedKey === 'm3u' ? '已复制' : '复制 m3u 地址'}
+              </button>
+            )}
+            {lan.running && (
+              <button className="btn btn-outline btn-sm" onClick={() => copyTo(lan.txt, 'txt')}>
+                {copiedKey === 'txt' ? '已复制' : '复制 txt 地址'}
               </button>
             )}
             {lan.running && (
@@ -384,7 +396,12 @@ function SettingsPage() {
             <p className="settings-hint">
               电视端（OK影视 / FongMi）：设置 → 直播 → 直播源，填 <code>{lan.m3u}</code>
               <br />
+              列表已按合集名分组（<code>group-title</code>），电视上可以按分组筛选；txt 源用 <code>{lan.txt}</code>
+              <br />
               手机或电脑浏览器直接打开 <code>{lan.web}</code> 也能播
+              <br />
+              播放列表每次请求都是实时生成的；电视端若看不到刚下完的新剧，在直播页菜单里
+              <b>刷新节目源</b>（或重开应用）即可
             </p>
           )}
           <p className="settings-hint">
