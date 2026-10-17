@@ -151,7 +151,7 @@ function DouyinDownload({ onNavigate }) {
           }}
         />
         <div className="dy-input-actions">
-          <span className="dy-hint">解析需要后台渲染页面，通常 3–8 秒；同一作者/合集再次解析会更快</span>
+          <span className="dy-hint">短剧约 1–3 秒（纯接口）；合集需渲染页面，约 3–8 秒</span>
           <div className="dy-actions-right">
             <button
               className="btn btn-outline btn-sm"

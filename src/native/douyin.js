@@ -109,6 +109,8 @@ function cleanTitle(raw) {
     // 只有跟在分隔符后面才算站名后缀，避免「重生之我在抖音」被削掉
     .replace(/[_|·•\-—–\s]+(抖音短剧|抖音小助手|抖音号|抖音)\s*$/i, '')
     .replace(/^(抖音短剧|抖音)[\s:：\-]+/i, '')
+    // 接口里常返回「合集 · 剧名」
+    .replace(/^合集[\s·•:：\-]+/,'')
     .replace(/[_|·•\-—–\s]+DOU\+?.*$/i, '')
     .replace(/《|》|【|】/g, '')
     .replace(/\s+/g, ' ')
@@ -353,21 +355,41 @@ function mixFromAweme(item) {
   };
 }
 
-/** 挑选无水印直链：bit_rate 高清优先，其次 play_addr，最后 download_addr 去水印 */
+/**
+ * 由 video_id 直接拼无水印播放地址。
+ * 短剧条目里通常只有 video.vid，没有 play_addr；这个经典 play 接口实测
+ * 返回 206 + video/mp4 + ftyp，不需要签名，也不需要 Cookie。
+ */
+function playUrlFromVid(vid, ratio = '1080p') {
+  const id = String(vid || '').trim();
+  if (!id) return '';
+  return `https://aweme.snssdk.com/aweme/v1/play/?video_id=${encodeURIComponent(id)}&ratio=${ratio}&line=0`;
+}
+
+/** 挑选无水印直链：bit_rate 高清优先，其次 play_addr，最后 download_addr 去水印；都没有则用 vid 拼 */
 function pickVideoUrl(video) {
   const candidates = [];
   const push = (raw) => {
     if (typeof raw === 'string' && /^https?:\/\//.test(raw)) candidates.push(raw);
   };
-  for (const rate of (video && video.bit_rate) || []) {
-    if (!rate || !rate.play_addr) continue;
-    for (const url of rate.play_addr.url_list || []) push(url);
+  // bit_rate 可能是数组，也可能是对象（短剧接口返回对象）
+  const rates = video && video.bit_rate;
+  const rateList = Array.isArray(rates) ? rates : (rates && typeof rates === 'object' ? Object.values(rates) : []);
+  for (const rate of rateList) {
+    if (!rate || typeof rate !== 'object') continue;
+    const addr = rate.play_addr || rate.playAddr;
+    for (const url of (addr && addr.url_list) || []) push(url);
   }
   if (video && video.play_addr) {
     for (const url of video.play_addr.url_list || []) push(url);
   }
   if (video && video.download_addr) {
     for (const url of video.download_addr.url_list || []) push(url);
+  }
+  if (video && video.play_api) push(video.play_api);
+  if (!candidates.length && video && video.vid) {
+    const built = playUrlFromVid(video.vid);
+    if (built) return built;
   }
   if (!candidates.length) return '';
   const cleaned = candidates.map((url) => url.replace(/\/playwm\//g, '/play/').replace(/playwm/g, 'play'));
@@ -377,10 +399,12 @@ function pickVideoUrl(video) {
 /** 单条 aweme -> 统一结构 */
 function normalizeAweme(aweme, index) {
   const video = (aweme && aweme.video) || {};
+  // 只有「数组且非空」才算图文；短剧接口的 images 是对象，不能据此判成图文
   const images = Array.isArray(aweme && aweme.images) && aweme.images.length ? aweme.images : null;
-  const title = String((aweme && aweme.desc) || '').trim();
+  const title = String((aweme && (aweme.desc || aweme.item_title || aweme.caption)) || '').trim();
   return {
-    aweme_id: String((aweme && aweme.aweme_id) || ''),
+    aweme_id: String((aweme && (aweme.aweme_id || aweme.item_id)) || ''),
+    vid: String((video && video.vid) || ''),
     index,
     title: title || `作品 ${index}`,
     cover: pickCover(video, aweme),
@@ -990,6 +1014,96 @@ async function itemsFromCapture(captured, onProgress) {
   return items.map((item) => ({ ...item, play_url: item.url || '' }));
 }
 
+const PLAYLET_PAGE_SIZE = 10;
+const PLAYLET_MAX_PAGES = 60;
+
+/**
+ * 短剧走纯 HTTP：/web/api/playlet/detail 拿名字与总集数，
+ * /web/api/playlet/item/list 按 cursor 翻页拿全部条目（每条带 video.vid）。
+ * 这条路不开窗口，1 秒级完成，也不受渲染/风控影响。
+ */
+async function fetchPlaylet(playletId, onProgress) {
+  const id = String(playletId);
+  const headers = {
+    'User-Agent': MOBILE_UA,
+    Referer: `https://www.iesdouyin.com/share/playlet/detail/${id}/`,
+    Accept: 'application/json, text/plain, */*',
+  };
+
+  let name = '';
+  let author = '';
+  let total = 0;
+  try {
+    const detail = await withTimeout(
+      axios.get(`https://www.iesdouyin.com/web/api/playlet/detail/?playlet_id=${id}`, {
+        headers, timeout: 15000, responseType: 'json',
+      }),
+      15000,
+      'playlet detail'
+    );
+    const info = (detail.data && detail.data.playlet_info) || {};
+    name = usableName(info.playlet_name) || usableName(info.title);
+    author = String((info.author && (info.author.nickname || info.author.unique_id)) || '').trim();
+    total = Number(info.total_episode) || 0;
+    log('[playlet] detail name=' + JSON.stringify(name) + ' total=' + total + ' author=' + JSON.stringify(author));
+  } catch (error) {
+    log('[playlet] detail 失败:', error.message);
+  }
+
+  const items = [];
+  const seen = new Set();
+  let cursor = 0;
+
+  for (let page = 0; page < PLAYLET_MAX_PAGES; page++) {
+    let data = null;
+    try {
+      const res = await withTimeout(
+        axios.get(
+          `https://www.iesdouyin.com/web/api/playlet/item/list/?playlet_id=${id}&count=${PLAYLET_PAGE_SIZE}&cursor=${cursor}`,
+          { headers, timeout: 15000, responseType: 'json' }
+        ),
+        15000,
+        'playlet list'
+      );
+      data = res.data || {};
+    } catch (error) {
+      log('[playlet] 第' + (page + 1) + '页请求失败:', error.message);
+      break;
+    }
+
+    const list = Array.isArray(data.aweme_list) ? data.aweme_list : [];
+    let added = 0;
+    for (const aweme of list) {
+      const item = normalizeAweme(aweme, items.length + 1);
+      if (!item.aweme_id || seen.has(item.aweme_id)) continue;
+      seen.add(item.aweme_id);
+      items.push(item);
+      added += 1;
+      if (!name) name = usableName(aweme && aweme.playlet_info && aweme.playlet_info.playlet_name);
+    }
+
+    log(
+      '[playlet] 第' + (page + 1) + '页 list=' + list.length +
+      ' new=' + added + ' total=' + items.length +
+      ' has_more=' + data.has_more + ' cursor=' + data.cursor
+    );
+    onProgress({ stage: 'page', pages: page + 1, found: items.length });
+
+    if (!list.length || data.has_more === false) break;
+    const next = Number(data.cursor);
+    if (!Number.isFinite(next) || next === cursor) break;
+    cursor = next;
+  }
+
+  if (!items.length) return null;
+  return {
+    items: items.map((item) => ({ ...item, play_url: item.url || '' })),
+    name,
+    author,
+    total: total || items.length,
+  };
+}
+
 function collectionResult(mixId, mixName, author, items, extra = {}) {
   const usableCount = items.filter((item) => item.type === 'video' && item.url).length;
   return {
@@ -1080,7 +1194,26 @@ async function resolveCollection(input, options = {}) {
   }
 
   if (target.kind === 'playlet') {
-    // 短剧：先官方分享页（无分页、最轻），拿不到再退到 Web 合集页
+    // 短剧优先走纯 HTTP：快、稳、不开窗口
+    log('[result] 短剧：尝试 HTTP 接口');
+    try {
+      const playlet = await fetchPlaylet(target.id, onProgress);
+      if (playlet) {
+        const mixName = usableName(playlet.name) || usableName(titleHint) || `短剧${target.id.slice(-6)}`;
+        const result = collectionResult(target.id, mixName, playlet.author, playlet.items);
+        log(
+          '[result] 成功 name=' + JSON.stringify(mixName),
+          'total=' + result.total,
+          'videos=' + result.videos,
+          'entry=http-playlet'
+        );
+        return finish(result);
+      }
+      log('[result] HTTP 短剧接口无数据，退回窗口抓取');
+    } catch (error) {
+      log('[result] HTTP 短剧接口异常：' + error.message + '，退回窗口抓取');
+    }
+    // 兜底：分享页（无分页）→ Web 合集页
     return finish(await readPage([
       `https://www.iesdouyin.com/share/playlet/detail/${target.id}/`,
       `https://www.douyin.com/collection/${target.id}`,
@@ -1115,6 +1248,7 @@ module.exports = {
   REFERER,
   sanitizeName,
   cleanTitle,
+  playUrlFromVid,
   resolveCollection,
   resolvePlayUrl,
   resolveCollectionTarget,

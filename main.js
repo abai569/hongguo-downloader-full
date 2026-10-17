@@ -898,11 +898,15 @@ async function downloadDouyinVideo(task, attempt) {
   task.error = '';
   sendToRenderer('download-progress', { id, progress: 0, receivedBytes: 0, totalBytes: 0, message: '' });
 
-  // 直链带签名且有时效：首次直接用解析时拿到的地址，重试时重新解析
+  // 直链带签名且有时效：首次直接用解析阶段拿到的地址；
+  // 重试时优先用 vid 重新拼（短剧的 play 接口不需要签名），再退回通用解析
   let play = null;
   if (attempt === 1 && info.play_url) {
     play = { url: info.play_url, referer: douyin.REFERER };
     console.log('[Douyin] 使用解析阶段的直链');
+  } else if (info.vid) {
+    play = { url: douyin.playUrlFromVid(info.vid), referer: douyin.REFERER };
+    console.log('[Douyin] 按 vid 重建直链');
   } else {
     play = await douyin.resolvePlayUrl(info.aweme_id);
   }
@@ -2824,6 +2828,7 @@ function enqueueDouyinItems(payload) {
         author: author || '',
         index,
         aweme_id: awemeId,
+        vid: item.vid || '',
         title: item.title || '',
         play_url: item.play_url || item.url || '',
       },
