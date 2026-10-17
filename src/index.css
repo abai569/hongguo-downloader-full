@@ -99,6 +99,17 @@ body {
   font-weight: 600;
   color: #fff;
   line-height: 1.2;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+/* 版本号跟在名字后面，同一行、小字 */
+.sidebar-brand .brand-ver {
+  font-size: 11px;
+  font-weight: 400;
+  color: #8a93a8;
 }
 
 .sidebar-brand .brand-sub {

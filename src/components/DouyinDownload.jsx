@@ -130,20 +130,20 @@ function DouyinDownload({ onNavigate }) {
           <Music size={32} />
         </div>
         <div className="hero-text">
-          <h2>抖音合集批量下载</h2>
-          <p>粘贴抖音合集分享链接或分享文案，自动枚举全部作品并无水印下载，支持一键合并成整部。</p>
+          <h2>抖音批量下载</h2>
+          <p>粘贴抖音短剧、合集、单条作品、用户主页或收藏的链接/分享文案，自动枚举作品并无水印下载，支持一键合并成整部。</p>
         </div>
       </div>
 
       <div className="hongguo-card">
         <div className="card-header-title">
           <Link2 size={18} />
-          <span>粘贴合集链接 / 分享文案</span>
+          <span>粘贴抖音链接 / 分享文案</span>
         </div>
         <textarea
           className="dy-input"
           rows={3}
-          placeholder={'例如：3.28 复制打开抖音，看看【某某的作品】合集 https://v.douyin.com/xxxxxx/'}
+          placeholder={'例如：3.28 复制打开抖音，看看【某某的作品】… https://v.douyin.com/xxxxxx/'}
           value={input}
           onChange={(event) => setInput(event.target.value)}
           onKeyDown={(event) => {
@@ -158,7 +158,7 @@ function DouyinDownload({ onNavigate }) {
               onClick={() => window.electronAPI.openDouyinLog && window.electronAPI.openDouyinLog()}
               title="解析卡住或失败时，把日志文件发给开发者"
             >
-              查看解析日志
+              日志
             </button>
             <button className="btn btn-primary" onClick={handleResolve} disabled={loading}>
               {loading ? (
@@ -169,15 +169,17 @@ function DouyinDownload({ onNavigate }) {
               ) : (
                 <>
                   <Music size={16} />
-                  <span>解析合集</span>
+                  <span>解析</span>
                 </>
               )}
             </button>
+            {/* 解析状态跟在两个按钮右边，不再单独占一行 */}
+            {loading && progressText(progress) && (
+              <span className="dy-inline-status">{progressText(progress)}</span>
+            )}
+            {!loading && successMsg && <span className="dy-inline-status dy-inline-ok">{successMsg}</span>}
           </div>
         </div>
-        {loading && progressText(progress) && (
-          <div className="dy-progress-hint">{progressText(progress)}</div>
-        )}
         {errorMsg && (
           <div className="alert alert-error dy-alert">
             <span>{errorMsg}</span>
@@ -190,7 +192,6 @@ function DouyinDownload({ onNavigate }) {
             </button>
           </div>
         )}
-        {successMsg && <div className="alert alert-success">{successMsg}</div>}
       </div>
 
       {collection && (

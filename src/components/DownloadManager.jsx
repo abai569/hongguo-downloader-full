@@ -108,7 +108,15 @@ function DownloadManager({ onNavigate }) {
       }),
       window.electronAPI.onDownloadTaskAdded(() => refresh()),
       window.electronAPI.onDownloadCompleted((data) => {
-        setTasks((prev) => prev.map((t) => (t.id === data.id ? { ...t, status: 'completed', progress: 100 } : t)));
+        setTasks((prev) => prev.map((t) => {
+          if (t.id !== data.id) return t;
+          const next = { ...t, status: 'completed', progress: 100 };
+          // 下载完成后主进程会回读实际分辨率（抖音给的是源站档位，可能 576p 也可能 4K）
+          if (data.resolution) {
+            next.douyinInfo = { ...(t.douyinInfo || {}), resolution: data.resolution };
+          }
+          return next;
+        }));
       }),
       window.electronAPI.onDownloadFailed((data) => {
         setTasks((prev) => prev.map((t) => (t.id === data.id ? { ...t, status: 'failed', error: data.error } : t)));
@@ -553,6 +561,12 @@ function DownloadManager({ onNavigate }) {
                   <div className="dm-task-title">{task.title || task.filename}</div>
                   <div className="dm-task-meta">
                     <span className={`status-tag status-${task.status}`}>{STATUS_TEXT[task.status] || task.status}</span>
+                    {task.douyinInfo && task.douyinInfo.resolution && (
+                      <span className="dm-size" title={task.douyinInfo.codec ? `编码 ${task.douyinInfo.codec}` : ''}>
+                        {task.douyinInfo.resolution}
+                        {task.douyinInfo.codec ? ` · ${task.douyinInfo.codec}` : ''}
+                      </span>
+                    )}
                     {task.status === 'downloading' && task.totalBytes > 0 && (
                       <span className="dm-size">{fmtBytes(task.receivedBytes)} / {fmtBytes(task.totalBytes)}</span>
                     )}

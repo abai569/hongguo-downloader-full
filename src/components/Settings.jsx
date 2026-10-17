@@ -231,13 +231,46 @@ function SettingsPage() {
               onChange={(e) => update('douyin_parse_window', e.target.checked)}
             />
             <span className="proxy-switch-text">
-              解析合集时显示窗口
-              <em>默认隐藏。遇到风控验证页时打开，可手动完成验证后再解析</em>
+              解析卡住时自动显示窗口
+              <em>平时解析全程不弹窗；只有一条数据都抓不到时（通常是验证页）才弹出，且不抢焦点，方便手动完成验证</em>
             </span>
           </label>
           <p className="settings-hint">
-            合集解析会在后台打开抖音页面并抓取接口，通常 3–8 秒；缓存与 Cookie 会跨次复用。保存后立即生效。
+            解析会在后台打开抖音页面并抓取接口，短剧 1–3 秒、主页/合集 3–10 秒；缓存与 Cookie 会跨次复用。保存后立即生效。
           </p>
+          <div className="settings-group">
+            <label className="settings-label">下载画质</label>
+            <select
+              className="input-field select-field"
+              value={settings.douyin_quality || 'best'}
+              onChange={(e) => update('douyin_quality', e.target.value)}
+            >
+              <option value="best">最高（可能到 4K，体积最大）</option>
+              <option value="1080p">1080p</option>
+              <option value="720p">720p</option>
+              <option value="540p">540p（省流量）</option>
+            </select>
+            <p className="settings-hint">
+              抖音接口的画质只是「偏好」：选 1080p 仍可能拿到更高清。选「最高」则不传参数，完全跟随源站。
+            </p>
+          </div>
+          <div className="settings-group">
+            <label className="settings-label">作品排序 / 编号</label>
+            <select
+              className="input-field select-field"
+              value={settings.douyin_sort || 'smart'}
+              onChange={(e) => update('douyin_sort', e.target.value)}
+            >
+              <option value="smart">智能（推荐：有集数按集数，其余按发布时间正序）</option>
+              <option value="episode">只按集数（"第N集"升序，识别不到的排最后）</option>
+              <option value="time-asc">按发布时间正序（最早 → 最新）</option>
+              <option value="time-desc">按发布时间倒序（最新 → 最早）</option>
+              <option value="original">接口原始顺序（抖音返回什么就什么）</option>
+            </select>
+            <p className="settings-hint">
+              编号（001、002…）就是排序后的顺序，合并时也按这个顺序拼接。抖音接口原始顺序既不是时间序也不是集数序，建议保持「智能」。
+            </p>
+          </div>
           <div className="proxy-status-row">
             <button
               className="btn btn-outline btn-sm"

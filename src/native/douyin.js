@@ -268,7 +268,9 @@ async function resolveViaWindow(url, showWindow) {
   const win = new BrowserWindow({
     width: 1120,
     height: 820,
-    show: !!showWindow,
+    // 一律隐藏创建：正常解析全程不打扰，只有真卡住时（见 maybeShowForVerify）才被动弹出
+    show: false,
+    skipTaskbar: true,
     title: '抖音链接解析',
     webPreferences: {
       sandbox: false,
@@ -384,11 +386,16 @@ function mixFromAweme(item) {
  * 由 video_id 直接拼无水印播放地址。
  * 短剧条目里通常只有 video.vid，没有 play_addr；这个经典 play 接口实测
  * 返回 206 + video/mp4 + ftyp，不需要签名，也不需要 Cookie。
+ *
+ * 注意：ratio 只是「偏好」，不是上限 —— 实测传 1080p 仍可能拿到 4K 源，
+ * 所以 best（默认）索性不传，让服务端给最高档。
  */
-function playUrlFromVid(vid, ratio = '1080p') {
+function playUrlFromVid(vid, ratio = 'best') {
   const id = String(vid || '').trim();
   if (!id) return '';
-  return `https://aweme.snssdk.com/aweme/v1/play/?video_id=${encodeURIComponent(id)}&ratio=${ratio}&line=0`;
+  const quality = String(ratio || 'best').trim();
+  const ratioPart = !quality || quality === 'best' ? '' : `&ratio=${encodeURIComponent(quality)}`;
+  return `https://aweme.snssdk.com/aweme/v1/play/?video_id=${encodeURIComponent(id)}${ratioPart}&line=0`;
 }
 
 /** 深扫任意 JSON 找 mix_info（单条作品自动扩成合集/短剧时用） */
@@ -455,12 +462,97 @@ function normalizeAweme(aweme, index) {
     vid: String((video && video.vid) || ''),
     index,
     title: title || `作品 ${index}`,
+    // 用于排序：接口给的是秒级时间戳
+    create_time: Number((aweme && (aweme.create_time || aweme.createTime)) || 0) || 0,
     cover: pickCover(video, aweme),
     duration: video && video.duration ? Math.round(video.duration / 1000) : 0,
     url: images ? '' : pickVideoUrl(video),
     type: images ? 'images' : 'video',
     music: (aweme && aweme.music && aweme.music.title) || '',
   };
+}
+
+/** 中文数字 → 整数（十二 / 二十五 / 一百零八） */
+const CN_DIGITS = { 零: 0, 〇: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+function chineseToNumber(raw) {
+  const text = String(raw || '').trim();
+  if (!text) return 0;
+  if (/^\d+$/.test(text)) return parseInt(text, 10);
+  let section = 0;
+  let num = 0;
+  for (const ch of text) {
+    if (CN_DIGITS[ch] !== undefined) {
+      num = CN_DIGITS[ch];
+    } else if (ch === '十') {
+      section += (num || 1) * 10;
+      num = 0;
+    } else if (ch === '百') {
+      section += (num || 1) * 100;
+      num = 0;
+    } else if (ch === '千') {
+      section += (num || 1) * 1000;
+      num = 0;
+    } else {
+      return 0;
+    }
+  }
+  return section + num;
+}
+
+/** 从标题里猜集数，猜不到返回 0 */
+function episodeFromTitle(title) {
+  const text = String(title || '');
+  if (!text) return 0;
+  let m = text.match(/第\s*([0-9]{1,4})\s*[集话期篇回]/);
+  if (m) return parseInt(m[1], 10);
+  m = text.match(/第\s*([零〇一二两三四五六七八九十百千]{1,6})\s*[集话期篇回]/);
+  if (m) return chineseToNumber(m[1]);
+  m = text.match(/(?:更新至|更新到|全)\s*([0-9]{1,4})\s*[集话期篇]/);
+  if (m) return parseInt(m[1], 10);
+  // 「12集来了」这类没有「第」的写法
+  m = text.match(/([0-9]{1,3})\s*[集话期](?![0-9])/);
+  if (m) return parseInt(m[1], 10);
+  // 「二十集」这类纯中文且不带「第」
+  m = text.match(/([零〇一二两三四五六七八九十百千]{1,6})\s*[集话期]/);
+  if (m) return chineseToNumber(m[1]);
+  return 0;
+}
+
+const SORT_MODES = ['smart', 'episode', 'time-asc', 'time-desc', 'original'];
+
+/**
+ * 作品排序 + 重编号。
+ * smart（默认）：能解析出集数的按集数升序排前面，解析不到的按发布时间升序排后面。
+ * 抖音接口的原始顺序既不是时间序也不是集数序（前几条常常乱），所以必须自己排。
+ */
+function orderItems(items, mode) {
+  const list = Array.isArray(items) ? items.slice() : [];
+  const sortMode = SORT_MODES.includes(String(mode)) ? String(mode) : 'smart';
+  if (sortMode === 'original') {
+    return list.map((item, i) => ({ ...item, index: i + 1 }));
+  }
+  const rows = list.map((item) => ({
+    item,
+    ep: episodeFromTitle(item && item.title),
+    ct: Number(item && item.create_time) || 0,
+  }));
+  const byTime = (a, b) => a.ct - b.ct;
+  if (sortMode === 'episode') {
+    rows.sort((a, b) => (a.ep || 999999) - (b.ep || 999999) || byTime(a, b));
+  } else if (sortMode === 'time-desc') {
+    rows.sort((a, b) => b.ct - a.ct);
+  } else if (sortMode === 'time-asc') {
+    rows.sort(byTime);
+  } else {
+    rows.sort((a, b) => {
+      const aHas = a.ep > 0 ? 0 : 1;
+      const bHas = b.ep > 0 ? 0 : 1;
+      if (aHas !== bHas) return aHas - bHas;
+      if (aHas === 0 && a.ep !== b.ep) return a.ep - b.ep;
+      return byTime(a, b);
+    });
+  }
+  return rows.map((row, i) => ({ ...row.item, index: i + 1, episode: row.ep || 0 }));
 }
 
 /**
@@ -619,6 +711,27 @@ function makeIngest(state, onProgress, notify) {
   };
 }
 
+/**
+ * 只在「抓不到任何数据」时把窗口弹出来（典型是风控/验证页需要人工点一下）。
+ * 用 showInactive：不抢焦点，不打断用户正在做的事。
+ */
+function maybeShowForVerify(win, allowed, label) {
+  if (!allowed) {
+    log('[' + (label || 'capture') + '] 未抓到数据；如需手动过验证，可在设置里打开「解析卡住时自动显示窗口」');
+    return false;
+  }
+  if (!win || win.isDestroyed()) return false;
+  try {
+    win.setSkipTaskbar(false);
+    win.showInactive();
+    log('[' + (label || 'capture') + '] 未抓到数据，已弹出窗口（不抢焦点），可能需要在窗口里完成验证');
+    return true;
+  } catch (error) {
+    log('[' + (label || 'capture') + '] 弹出窗口失败:', error.message);
+    return false;
+  }
+}
+
 const HOOK_PRELOAD = path.join(__dirname, 'douyin-hook.js');
 
 /**
@@ -659,7 +772,10 @@ async function capturePage(pageUrlOrId, options) {
   const win = new BrowserWindow({
     width: 1120,
     height: 820,
-    show: !!showWindow,
+    // 关键：不再按设置直接显示。窗口始终隐藏创建，只有抓到 0 条数据（大概率是
+    // 风控/验证页）时才 showInactive 弹出来让用户过验证，且不抢焦点。
+    show: false,
+    skipTaskbar: true,
     title: '抖音合集解析',
     webPreferences: {
       // 沙箱 preload + 关闭隔离：能在页面世界拦截 fetch/XHR，但页面拿不到 Node 能力
@@ -671,6 +787,8 @@ async function capturePage(pageUrlOrId, options) {
       partition: 'persist:douyin-parse',
       // 隐藏窗口默认会被节流（定时器/渲染降速），抖音这类 SPA 会因此迟迟不发请求
       backgroundThrottling: false,
+      // 隐藏状态下也要正常渲染，否则页面可能不发起接口请求
+      paintWhenInitiallyHidden: true,
     },
   });
   hardenWindow(win, 'capture');
@@ -679,6 +797,7 @@ async function capturePage(pageUrlOrId, options) {
   const state = { pages: [], hasMore: true, bodies: 0, seen: 0, media: [], name: '', xhrs: 0 };
   let attached = false;
   let polling = true;
+  let shownForVerify = false;
 
   // 事件驱动的"首批数据到达"等待：轮询会有 400ms 抖动，这里一有数据立刻醒
   let wake = null;
@@ -829,6 +948,8 @@ async function capturePage(pageUrlOrId, options) {
       } catch (error) {
         log('[capture] 首屏超时，未捕获到任何作品 xhr=' + state.xhrs + '（诊断读取失败: ' + error.message + '）');
       }
+      // 正常解析不弹窗；只有这里（0 条数据）才被动弹出，方便用户手动过验证
+      shownForVerify = maybeShowForVerify(win, !!showWindow, 'capture');
     }
 
     if (!paged) {
@@ -886,6 +1007,14 @@ async function capturePage(pageUrlOrId, options) {
       ' bodies=' + state.bodies +
       ' hasMore=' + state.hasMore
     );
+    // 之前因为在等验证而弹出过窗口，现在已经抓到数据 → 收回，别继续挡着用户
+    if (shownForVerify && hasCapture(state)) {
+      try {
+        win.hide();
+        win.setSkipTaskbar(true);
+        log('[capture] 已抓到数据，收回弹出的窗口');
+      } catch (_) {}
+    }
     log('[perf] 抓取结束 ' + (Date.now() - t0) + 'ms');
 
     let mixName = '';
@@ -1407,16 +1536,22 @@ async function openLoginWindow() {
 }
 
 function collectionResult(mixId, mixName, author, items, extra = {}) {
-  const usableCount = items.filter((item) => item.type === 'video' && item.url).length;
+  const { sortMode, ...rest } = extra;
+  const ordered = orderItems(items, sortMode);
+  const usableCount = ordered.filter((item) => item.type === 'video' && item.url).length;
+  if (ordered.length !== items.length || sortMode) {
+    const withEp = ordered.filter((item) => item.episode > 0).length;
+    log('[order] 排序模式=' + (sortMode || 'smart') + ' 共' + ordered.length + '条 可识别集数=' + withEp);
+  }
   return {
     mix_id: String(mixId),
     mix_name: mixName,
     author: author || '',
-    total: items.length,
+    total: ordered.length,
     videos: usableCount,
-    images: items.filter((item) => item.type !== 'video').length,
-    items,
-    ...extra,
+    images: ordered.filter((item) => item.type !== 'video').length,
+    items: ordered,
+    ...rest,
   };
 }
 
@@ -1472,13 +1607,22 @@ async function resolveCollection(input, options = {}) {
           : (/^\d+$/.test(keyText)
             ? `合集${keyText.slice(-6)}`
             : (usableName(captured.author) ? `${usableName(captured.author)} 的作品` : `主页${keyText.slice(-6)}`));
-        const mixName = usableName(captured.mixName)
-          || usableName(captured.detectedName)
-          || usableName(hintName)
-          || usableName(titleHint)
-          || usableName(captured.pageTitle)
-          || fallbackName;
-        const result = collectionResult(keyId, mixName, captured.author, items);
+        // 主页（sec_uid）优先用作者名命名；合集/短剧仍优先用合集名
+        const isUserKey = !keyText.startsWith('fav-') && !/^\d+$/.test(keyText);
+        const authorName = usableName(captured.author) ? `${usableName(captured.author)} 的作品` : '';
+        const nameCandidates = isUserKey
+          ? [authorName, captured.mixName, captured.detectedName, hintName, titleHint, captured.pageTitle]
+          : [captured.mixName, captured.detectedName, hintName, titleHint, captured.pageTitle];
+        let mixName = '';
+        for (const candidate of nameCandidates) {
+          const n = usableName(candidate);
+          if (n) {
+            mixName = n;
+            break;
+          }
+        }
+        if (!mixName) mixName = fallbackName;
+        const result = collectionResult(keyId, mixName, captured.author, items, { sortMode: options.sortMode });
         log(
           '[result] 成功 name=' + JSON.stringify(mixName),
           'total=' + result.total,
@@ -1525,7 +1669,7 @@ async function resolveCollection(input, options = {}) {
       const playlet = await fetchPlaylet(target.id, onProgress);
       if (playlet) {
         const mixName = usableName(playlet.name) || usableName(titleHint) || `短剧${target.id.slice(-6)}`;
-        const result = collectionResult(target.id, mixName, playlet.author, playlet.items);
+        const result = collectionResult(target.id, mixName, playlet.author, playlet.items, { sortMode: options.sortMode });
         log(
           '[result] 成功 name=' + JSON.stringify(mixName),
           'total=' + result.total,

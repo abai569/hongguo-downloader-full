@@ -65,8 +65,10 @@ export default function App() {
             <Film size={18} />
           </div>
           <div>
-            <div className="brand-text">{appInfo ? appInfo.brand : '红果短剧下载器'}</div>
-            <div className="brand-sub">红果短剧下载器 v{appInfo ? appInfo.version : ''}</div>
+            <div className="brand-text">
+              {appInfo ? appInfo.brand : '果抖下载器'}
+              <span className="brand-ver">v{appInfo ? appInfo.version : ''}</span>
+            </div>
           </div>
         </div>
 

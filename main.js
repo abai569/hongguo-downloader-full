@@ -1,8 +1,9 @@
 /**
- * main.js - 红果短剧下载器（独立版）主进程
+ * main.js - 果抖下载器（独立版）主进程
  *
  * 功能：
  *   1. 红果短剧解析（分享链接 / series_id -> 全剧集列表）
+ *   2. 抖音解析下载（短剧 / 合集 / 单条 / 用户主页 / 收藏）
  *   2. 批量提交下载任务到下载队列
  *   3. 并发下载：流式下载播放直链 -> spade_a 派生 AES Key -> CENC-AES-CTR 解密 -> 输出 mp4
  *   4. 下载管理：进度推送、暂停/取消、重试、删除、打开所在文件夹
@@ -19,7 +20,7 @@ const douyin = require('./src/native/douyin');
 const store = require('./src/store');
 const APP_VERSION = app.getVersion() || '1.0.0';
 
-const APP_TITLE = '红果短剧下载器';
+const APP_TITLE = '果抖下载器';
 
 // 单实例：避免多个进程同时写 data.json 导致下载列表错乱或临时文件损坏
 if (!app.requestSingleInstanceLock()) {
@@ -116,8 +117,12 @@ function getDefaultSettings() {
     auto_delete_watched: false,
     // 兼容模式：本机无法解码 HEVC 时自动转码为 H.264（解决「黑屏有声」）
     compat_mode: true,
-    // 抖音合集解析时显示窗口：默认隐藏，触发风控页时打开可用于手动过验证
-    douyin_parse_window: false,
+    // 抖音解析：默认全程隐藏窗口；勾选后仅在「一条数据都抓不到」时自动弹出（便于手动过验证）
+    douyin_parse_window: true,
+    // 抖音下载画质偏好：best=不传 ratio（实测给源站最高档，可能到 4K）·1080p·720p·540p
+    douyin_quality: 'best',
+    // 抖音作品排序：smart=有集数按集数（其余按发布时间正序）·episode·time-asc·time-desc·original
+    douyin_sort: 'smart',
     // ===== 网络代理 =====
     // proxy_enabled: 是否启用代理（关闭时忽略系统代理，直连）
     // proxy_mode:    system=跟随系统/环境变量 · custom=手动指定 · direct=强制直连
@@ -905,8 +910,8 @@ async function downloadDouyinVideo(task, attempt) {
     play = { url: info.play_url, referer: douyin.REFERER };
     console.log('[Douyin] 使用解析阶段的直链');
   } else if (info.vid) {
-    play = { url: douyin.playUrlFromVid(info.vid), referer: douyin.REFERER };
-    console.log('[Douyin] 按 vid 重建直链');
+    play = { url: douyin.playUrlFromVid(info.vid, info.quality), referer: douyin.REFERER };
+    console.log('[Douyin] 按 vid 重建直链 quality=' + (info.quality || 'best'));
   } else {
     play = await douyin.resolvePlayUrl(info.aweme_id);
   }
@@ -1055,6 +1060,20 @@ async function downloadDouyinVideo(task, attempt) {
     throw err;
   }
 
+  // 记录实际分辨率：接口的 ratio 只是偏好，实际可能是 576p 也可能是 4K
+  try {
+    const ffprobePath = resolveFfmpeg('ffprobe');
+    if (ffprobePath) {
+      const meta = await probeVideoInfo(ffprobePath, finalPath);
+      if (meta && meta.w && meta.h) {
+        task.douyinInfo = task.douyinInfo || {};
+        task.douyinInfo.resolution = `${meta.w}x${meta.h}`;
+        task.douyinInfo.codec = meta.codec || '';
+        douyin.log('[download] 分辨率 ' + task.douyinInfo.resolution + ' ' + (meta.codec || ''));
+      }
+    }
+  } catch (_) {}
+
   task.status = 'completed';
   task.progress = 100;
   task.error = '';
@@ -1063,7 +1082,11 @@ async function downloadDouyinVideo(task, attempt) {
 
   console.log('[Douyin] 下载完成:', finalPath);
   douyin.log('[download] 完成: ' + finalPath);
-  sendToRenderer('download-completed', { id, path: finalPath });
+  sendToRenderer('download-completed', {
+    id,
+    path: finalPath,
+    resolution: (task.douyinInfo && task.douyinInfo.resolution) || '',
+  });
 }
 
 // 向渲染进程发送事件
@@ -1587,7 +1610,7 @@ function probeVideoInfo(ffprobePath, file) {
     execFile(
       ffprobePath,
       ['-v', 'error', '-select_streams', 'v:0',
-       '-show_entries', 'stream=codec_name,width,height', '-of', 'json', file],
+       '-show_entries', 'stream=codec_name,width,height,avg_frame_rate', '-of', 'json', file],
       { timeout: 30000 },
       (err, stdout) => {
         if (err) return resolve(null);
@@ -1595,7 +1618,11 @@ function probeVideoInfo(ffprobePath, file) {
           const j = JSON.parse(stdout);
           const s = (j.streams || [])[0];
           if (!s) return resolve(null);
-          resolve({ codec: s.codec_name, w: s.width, h: s.height });
+          // avg_frame_rate 形如 "30/1" / "666055680/46970377"
+          let fps = 0;
+          const m = String(s.avg_frame_rate || '').split('/');
+          if (m.length === 2 && Number(m[1]) > 0) fps = Number(m[0]) / Number(m[1]);
+          resolve({ codec: s.codec_name, w: s.width, h: s.height, fps: Number.isFinite(fps) ? fps : 0 });
         } catch (_) {
           resolve(null);
         }
@@ -1758,20 +1785,40 @@ ipcMain.handle('merge-series', async (event, seriesId, outputName, options) => {
       }
     } catch (_) {}
 
-    // 编码一致性抽检（首集 vs 后续抽样）
+    // 合并前一致性检查：编码 / 分辨率 / 帧率 全量比对
+    // 混合 hevc+h264、2072x3840+1920x1080 直接 -c copy 硬拼会出现花屏、音画不同步，
+    // 所以发现不一致就自动切到兼容模式（转码），而不是只在界面上提示一句。
     let codecWarning = '';
+    let autoCompatible = false;
+    let baseParams = null;
     if (ffprobePath) {
-      const first = await probeVideoInfo(ffprobePath, ordered[0].path);
-      const sampleIdx = [Math.floor(ordered.length / 2), ordered.length - 1];
-      for (const i of sampleIdx) {
-        if (i <= 0 || i >= ordered.length) continue;
-        const s = await probeVideoInfo(ffprobePath, ordered[i].path);
-        if (first && s && (first.codec !== s.codec || first.w !== s.w || first.h !== s.h)) {
-          codecWarning = `第 ${ordered[i].vid_index} 集编码与首集不一致（${s.codec} ${s.w}x${s.h} vs ${first.codec} ${first.w}x${first.h}），合并后可能出现花屏`;
-          break;
+      const infos = [];
+      for (const e of ordered) {
+        const info = await probeVideoInfo(ffprobePath, e.path);
+        if (info && info.codec) infos.push({ ...info, vid_index: e.vid_index });
+      }
+      if (infos.length > 1) {
+        const base = infos[0];
+        baseParams = base;
+        const diff = infos.find(
+          (i) =>
+            i.codec !== base.codec ||
+            i.w !== base.w ||
+            i.h !== base.h ||
+            (i.fps && base.fps && Math.abs(i.fps - base.fps) > 0.5)
+        );
+        if (diff) {
+          const fmt = (i) => `${i.codec} ${i.w}x${i.h} ${i.fps ? i.fps.toFixed(2) + 'fps' : ''}`.trim();
+          codecWarning = `第 ${diff.vid_index} 集与首集参数不一致（${fmt(diff)} vs ${fmt(base)}）`;
+          if (!(options && options.compatible)) {
+            autoCompatible = true;
+            codecWarning += '；已自动改用兼容合并（转码）';
+          }
         }
       }
     }
+    const useCompatible = !!(options && options.compatible) || autoCompatible;
+    if (codecWarning) console.log('[Merge]', codecWarning);
 
     // 写 concat 列表（UTF-8 无 BOM；绝对路径配 -safe 0，规避中文/空格转义问题）
     const listPath = path.join(outDir, `.${baseName}.ffconcat.txt`);
@@ -1798,6 +1845,7 @@ ipcMain.handle('merge-series', async (event, seriesId, outputName, options) => {
       totalBytes,
       totalDuration,
       codecWarning,
+      autoCompatible,
       error: '',
       startTime: Date.now(),
     };
@@ -1809,7 +1857,7 @@ ipcMain.handle('merge-series', async (event, seriesId, outputName, options) => {
 
     // 兼容格式：转码为 H.264，任何播放器/电脑都能播（慢，但通用）
     let videoArgs;
-    if (options && options.compatible) {
+    if (useCompatible) {
       const encoder = await pickH264Encoder(ffmpegPath);
       videoArgs = encoder === 'libx264'
         ? ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-profile:v', 'high', '-level', '4.2']
@@ -1821,6 +1869,17 @@ ipcMain.handle('merge-series', async (event, seriesId, outputName, options) => {
         ? ['-c:v', 'h264_amf', '-quality', 'speed', '-rc', 'cqp', '-qp_i', '23', '-qp_p', '23']
         : ['-c:v', encoder, '-cq', '23'];
       videoArgs = [...videoArgs, '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '128k'];
+      // 各集分辨率/帧率不一致时，转码也要先统一，否则输出尺寸与时间轴仍会错乱
+      if (codecWarning && baseParams && baseParams.w && baseParams.h) {
+        const { w, h } = baseParams;
+        videoArgs = [
+          '-vf', `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,setsar=1`,
+          ...videoArgs,
+        ];
+        const fps = baseParams.fps ? Math.round(baseParams.fps) : 0;
+        if (fps > 0 && fps <= 120) videoArgs = ['-r', String(fps), ...videoArgs];
+        console.log('[Merge] 统一画面参数 ->', `${w}x${h}`, fps ? fps + 'fps' : '');
+      }
       console.log('[Merge] 兼容格式合并，编码器:', encoder);
     } else {
       videoArgs = ['-c', 'copy'];
@@ -1907,7 +1966,7 @@ ipcMain.handle('merge-series', async (event, seriesId, outputName, options) => {
         }
       } else {
         task.status = 'failed';
-        const hint = options && options.compatible ? '' : '；可改用「兼容合并」重试';
+        const hint = useCompatible ? '' : '；可改用「兼容合并」重试';
         task.error = `ffmpeg 退出码 ${code}${stderrTail ? '：' + stderrTail.split('\n').filter(Boolean).slice(-2).join(' ') : ''}${hint}`;
         try { fs.existsSync(tmpOutput) && fs.unlinkSync(tmpOutput); } catch (_) {}
       }
@@ -2750,6 +2809,7 @@ ipcMain.handle('douyin-resolve-collection', async (event, input) => {
     const data = await Promise.race([
       douyin.resolveCollection(input, {
         showWindow: settings.douyin_parse_window === true,
+        sortMode: settings.douyin_sort || 'smart',
         onProgress: (progress) => sendToRenderer('douyin-parse-progress', progress),
       }),
       timeout,
@@ -2813,7 +2873,49 @@ function enqueueDouyinItems(payload) {
   const root = (settings.root && String(settings.root).trim()) ? String(settings.root).trim() : app.getPath('downloads');
   const cleanMix = sanitizeFolderName(mixName) || `合集${String(mixId).slice(-6)}`;
   const downloadDir = path.join(root, '抖音', cleanMix);
+  const quality = String(settings.douyin_quality || 'best');
   let created = 0;
+
+  // 作品标题经常以合集名开头（「胖牛蛙湿地历险记 胖牛蛙湿地历险记第八集…」），
+  // 文件夹名已经是合集名，这里把重复前缀去掉，文件名才干净
+  const stripMixPrefix = (raw) => {
+    let title = String(raw || '').trim();
+    const mix = String(mixName || '').trim();
+    if (!mix) return title;
+    const norm = (s) => s.replace(/\s+/g, '').replace(/[·•:：\-—_]/g, '');
+    const nm = norm(mix);
+    if (!nm) return title;
+    // 反复剥离：标题里可能连续两次以合集名开头
+    for (let i = 0; i < 3; i++) {
+      const ntitle = norm(title);
+      if (ntitle.startsWith(nm)) {
+        // 找到原文里对应的截断位置
+        let count = 0;
+        let cut = 0;
+        for (let j = 0; j < title.length && count < nm.length; j++) {
+          const ch = title[j];
+          if (norm(ch)) count += norm(ch).length;
+          cut = j + 1;
+        }
+        title = title.slice(cut).replace(/^[\s·•:：\-—_]+/, '').trim();
+      } else {
+        break;
+      }
+    }
+    return title;
+  };
+
+  // 去掉话题标签：标题里的 #动画片 #搞笑 #治… 对文件名没意义，
+  // 而且按字数截断时经常被切成半截「#治」，所以先整体清掉
+  const stripTopics = (raw) => String(raw || '')
+    .replace(/#[^\s#]+/g, ' ')
+    .replace(/[\u3000\s]+/g, ' ')
+    .replace(/^[\s·•:：\-—_|,，。、]+/, '')
+    .replace(/[\s·•:：\-—_|,，。、]+$/, '')
+    .trim();
+
+  // 文件名/标题统一清洗：去合集名前缀 → 去话题 → 合并空格
+  const cleanDouyinTitle = (raw) => stripTopics(stripMixPrefix(raw));
 
   for (const item of items) {
     const awemeId = String((item && item.aweme_id) || '').trim();
@@ -2839,7 +2941,8 @@ function enqueueDouyinItems(payload) {
 
     const index = Number(item.index) || created + 1;
     const indexStr = String(index).padStart(3, '0');
-    const cleanTitle = sanitizeFolderName(item.title) || `作品${indexStr}`;
+    const rawTitle = cleanDouyinTitle(item.title) || cleanDouyinTitle(`作品${indexStr}`);
+    const cleanTitle = sanitizeFolderName(rawTitle) || `作品${indexStr}`;
     const filename = `${indexStr} ${cleanTitle.slice(0, 40)}.mp4`;
     const finalPath = path.join(downloadDir, filename);
 
@@ -2847,7 +2950,7 @@ function enqueueDouyinItems(payload) {
       id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
       savePath: finalPath,
       customDir: downloadDir,
-      title: `${indexStr} ${item.title || cleanMix}`.trim(),
+      title: `${indexStr} ${rawTitle || cleanMix}`.trim(),
       filename,
       platform: 'douyin',
       type: 'douyin',
@@ -2869,8 +2972,12 @@ function enqueueDouyinItems(payload) {
         index,
         aweme_id: awemeId,
         vid: item.vid || '',
-        title: item.title || '',
-        play_url: item.play_url || item.url || '',
+        title: rawTitle || item.title || '',
+        quality,
+        // 画质由设置决定：有 vid 就按偏好重建直链，否则沿用解析拿到的地址
+        play_url: item.vid
+          ? (douyin.playUrlFromVid(item.vid, quality) || item.play_url || item.url || '')
+          : (item.play_url || item.url || ''),
       },
     };
 
@@ -3432,7 +3539,7 @@ ipcMain.handle('open-folder', async (event, taskId) => {
 ipcMain.handle('get-app-info', async () => ({
   version: APP_VERSION,
   brand: APP_TITLE,
-  appName: '红果短剧下载器',
+  appName: APP_TITLE,
 }));
 
 // 打开外部链接（保留给需要时调用）
@@ -3599,6 +3706,52 @@ function createWindow() {
 }
 
 // ===== 应用生命周期 =====
+/**
+ * 清理 1.2.6 及更早版本（名为「红果短剧下载器」）留下的东西。
+ * appId 没变，所以是就地升级：安装目录和 %APPDATA%\hongguo-downloader 都沿用，
+ * 但快捷方式和 exe 文件名跟着 productName 变了，老的要删掉，否则开始菜单里会有两个图标。
+ */
+function cleanupLegacyInstall() {
+  if (!app.isPackaged) return;
+  const legacy = '红果短剧下载器';
+  const exeDir = path.dirname(app.getPath('exe'));
+  const startPrograms = path.join(app.getPath('appData'), 'Microsoft', 'Windows', 'Start Menu', 'Programs');
+  const desktop = app.getPath('desktop');
+  const currentExe = path.normalize(app.getPath('exe')).toLowerCase();
+
+  const files = [
+    path.join(startPrograms, `${legacy}.lnk`),
+    path.join(desktop, `${legacy}.lnk`),
+    path.join(exeDir, `${legacy}.exe`),
+    path.join(exeDir, `Uninstall ${legacy}.exe`),
+  ];
+
+  for (const file of files) {
+    try {
+      if (!fs.existsSync(file)) continue;
+      if (path.normalize(file).toLowerCase() === currentExe) continue;
+      fs.unlinkSync(file);
+      console.log('[Cleanup] 已删除旧版残留:', file);
+    } catch (error) {
+      console.warn('[Cleanup] 旧版残留删除失败:', file, error.message);
+    }
+  }
+
+  // 万一旧版把快捷方式建成了同名文件夹，也一并清掉（仅当里面只有 lnk）
+  try {
+    const dir = path.join(startPrograms, legacy);
+    if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) {
+      const entries = fs.readdirSync(dir);
+      if (entries.length <= 5 && entries.every((n) => /\.lnk$/i.test(n))) {
+        fs.rmSync(dir, { recursive: true, force: true });
+        console.log('[Cleanup] 已删除旧版开始菜单文件夹:', dir);
+      }
+    }
+  } catch (error) {
+    console.warn('[Cleanup] 旧版开始菜单文件夹清理失败:', error.message);
+  }
+}
+
 app.whenReady().then(async () => {
   const dataFile = path.join(app.getPath('userData'), 'data.json');
   store.init(dataFile);
@@ -3614,6 +3767,9 @@ app.whenReady().then(async () => {
 
   // 上次异常退出可能留下被残留句柄占用、删不掉的 *.enc.tmp，先清一遍
   try { cleanupStaleTempFiles(); } catch (e) { console.warn('[Cleanup] 清理残留临时文件失败:', e.message); }
+
+  // 改名后清掉旧版（红果短剧下载器）的快捷方式与 exe
+  try { cleanupLegacyInstall(); } catch (e) { console.warn('[Cleanup] 旧版残留清理失败:', e.message); }
 
   // 代理必须在创建窗口、发起任何请求之前生效
   await applyProxySettings(settings);

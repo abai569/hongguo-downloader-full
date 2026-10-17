@@ -39,6 +39,20 @@
   flex-shrink: 0;
 }
 
+/* 解析状态直接跟在按钮右侧，不单独占一行 */
+.dy-inline-status {
+  font-size: 12px;
+  color: var(--accent, #fe2c55);
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dy-inline-ok {
+  color: #18a058;
+}
+
 .dy-progress-hint {
   margin-top: 10px;
   font-size: 12px;
