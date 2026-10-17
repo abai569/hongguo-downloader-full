@@ -17,7 +17,7 @@ const REFERER = 'https://www.douyin.com/';
 const PAGE_API = /\/aweme\/v1\/web\/(mix\/aweme|aweme\/post|collection)/;
 const DETAIL_API = /\/aweme\/v1\/web\/(aweme\/detail|mix\/aweme)/;
 
-const FIRST_PAGE_TIMEOUT_MS = 20000;
+const FIRST_PAGE_TIMEOUT_MS = 12000;
 const SCROLL_WAIT_MS = 1100;
 const MAX_SCROLLS = 80;
 const LOG_MAX_BYTES = 2 * 1024 * 1024;
@@ -494,10 +494,12 @@ async function capturePage(pageUrlOrId, options) {
       nodeIntegration: false,
       // 固定分区：cookie 与静态资源缓存跨次解析复用，第二次起明显更快
       partition: 'persist:douyin-parse',
+      // 隐藏窗口默认会被节流（定时器/渲染降速），抖音这类 SPA 会因此迟迟不发请求
+      backgroundThrottling: false,
     },
   });
 
-  const state = { pages: [], hasMore: true, bodies: 0, seen: 0, media: [], name: '' };
+  const state = { pages: [], hasMore: true, bodies: 0, seen: 0, media: [], name: '', xhrs: 0 };
   let attached = false;
 
   // 事件驱动的"首批数据到达"等待：轮询会有 400ms 抖动，这里一有数据立刻醒
@@ -527,6 +529,7 @@ async function capturePage(pageUrlOrId, options) {
   });
 
   log('[capture] open', pageUrl, 'showWindow=' + !!showWindow + ' paged=' + paged);
+  onProgress({ stage: 'window', pages: 0, found: 0 });
 
   try {
     win.webContents.setUserAgent(UA);
@@ -547,6 +550,13 @@ async function capturePage(pageUrlOrId, options) {
         if (!url) return;
         const status = params.response.status;
         const generic = GENERIC_API.test(url);
+
+        // 记录页面发出的所有 XHR/Fetch：若一条都没有，说明页面根本没跑起来（节流/风控）
+        const kind = params.type;
+        if ((kind === 'XHR' || kind === 'Fetch') && state.xhrs < 60) {
+          state.xhrs += 1;
+          log('[capture] xhr', status, kind, urlPath(url));
+        }
 
         // 把页面实际发出的接口都记下来：
         // 接口一旦改名，这里能直接看出应该匹配什么路径
@@ -612,7 +622,7 @@ async function capturePage(pageUrlOrId, options) {
     });
 
     const gotFirst = await waitCapture(FIRST_PAGE_TIMEOUT_MS);
-    log('[perf] 首批数据 ' + (Date.now() - t0) + 'ms got=' + gotFirst);
+    log('[perf] 首批数据 ' + (Date.now() - t0) + 'ms got=' + gotFirst + ' xhr=' + state.xhrs);
 
     // 滚动需要 DOM 就绪，但最多再等 6 秒，不能无限等
     await Promise.race([loadPromise, delay(6000)]);
@@ -622,9 +632,25 @@ async function capturePage(pageUrlOrId, options) {
       pageTitle = String((await win.webContents.getTitle()) || '').trim();
       log('[capture] title=' + JSON.stringify(pageTitle));
     } catch (_) {}
+    onProgress({ stage: 'loaded', pages: state.bodies, found: mediaCount(state) });
 
     if (!hasCapture(state)) {
-      log('[capture] 首屏超时，未捕获到任何作品');
+      // 页面到底有没有跑起来：看 readyState / 地址 / 有没有发出接口
+      try {
+        const diag = await win.webContents.executeJavaScript(`(() => ({
+          ready: document.readyState,
+          href: location.href,
+          text: (document.body && document.body.innerText || '').replace(/\\s+/g, ' ').slice(0, 160),
+        }))()`, true);
+        log(
+          '[capture] 首屏超时，未捕获到任何作品 xhr=' + state.xhrs +
+          ' ready=' + (diag && diag.ready) +
+          ' href=' + urlPath(diag && diag.href) +
+          ' text=' + JSON.stringify((diag && diag.text) || '')
+        );
+      } catch (error) {
+        log('[capture] 首屏超时，未捕获到任何作品 xhr=' + state.xhrs + '（诊断读取失败: ' + error.message + '）');
+      }
     }
 
     if (!paged) {
@@ -953,48 +979,65 @@ async function resolveCollection(input, options = {}) {
 
   onProgress({ stage: 'opening', pages: 0, found: 0 });
 
-  const readPage = async (pageUrl, keyId, hintName, paged) => {
-    const captured = await capturePage(pageUrl, {
-      showWindow: options.showWindow,
-      paged,
-      onProgress,
-    });
-    const items = await itemsFromCapture(captured, onProgress);
-    if (!items.length) {
-      log('[result] 失败：没有解析到任何作品（' + urlPath(pageUrl) + '）');
-      throw new Error('未能解析出作品列表；若页面要求验证，请到设置里打开「解析合集时显示窗口」后重试');
+  const readPage = async (pageUrls, keyId, hintName, paged) => {
+    const urls = Array.isArray(pageUrls) ? pageUrls : [pageUrls];
+    let lastError = null;
+
+    for (const pageUrl of urls) {
+      try {
+        log('[result] 尝试入口 ' + urlPath(pageUrl));
+        const captured = await capturePage(pageUrl, {
+          showWindow: options.showWindow,
+          paged,
+          onProgress,
+        });
+        const items = await itemsFromCapture(captured, onProgress);
+        if (!items.length) {
+          log('[result] 该入口没有数据：' + urlPath(pageUrl));
+          continue;
+        }
+        const mixName = usableName(captured.mixName)
+          || usableName(captured.detectedName)
+          || usableName(hintName)
+          || usableName(titleHint)
+          || usableName(captured.pageTitle)
+          || `合集${String(keyId).slice(-6)}`;
+        const result = collectionResult(keyId, mixName, captured.author, items);
+        log(
+          '[result] 成功 name=' + JSON.stringify(mixName),
+          'total=' + result.total,
+          'videos=' + result.videos,
+          'images=' + result.images,
+          'entry=' + urlPath(pageUrl),
+          'source=' + (captured.pages.length ? 'cdp-list' : (captured.media.length ? 'cdp-media' : 'dom'))
+        );
+        return result;
+      } catch (error) {
+        lastError = error;
+        log('[result] 入口失败 ' + urlPath(pageUrl) + '：' + error.message);
+      }
     }
-    const mixName = usableName(captured.mixName)
-      || usableName(captured.detectedName)
-      || usableName(hintName)
-      || usableName(titleHint)
-      || usableName(captured.pageTitle)
-      || `合集${String(keyId).slice(-6)}`;
-    const result = collectionResult(keyId, mixName, captured.author, items);
-    log(
-      '[result] 成功 name=' + JSON.stringify(mixName),
-      'total=' + result.total,
-      'videos=' + result.videos,
-      'images=' + result.images,
-      'source=' + (captured.pages.length ? 'cdp-list' : (captured.media.length ? 'cdp-media' : 'dom'))
-    );
-    return result;
+
+    throw lastError || new Error('未能解析出作品列表；若页面要求验证，请到设置里打开「解析合集时显示窗口」后重试');
   };
 
   if (target.kind === 'collection') {
-    return finish(await readPage(`https://www.douyin.com/collection/${target.id}`, target.id, '', true));
+    return finish(await readPage([`https://www.douyin.com/collection/${target.id}`], target.id, '', true));
   }
 
   if (target.kind === 'playlet') {
-    // 短剧页无分页，跳过滚动
-    return finish(await readPage(`https://www.iesdouyin.com/share/playlet/detail/${target.id}/`, target.id, '', false));
+    // 短剧：先官方分享页（无分页、最轻），拿不到再退到 Web 合集页
+    return finish(await readPage([
+      `https://www.iesdouyin.com/share/playlet/detail/${target.id}/`,
+      `https://www.douyin.com/collection/${target.id}`,
+    ], target.id, '', false));
   }
 
   // 单条作品：先取详情，若属于合集则顺势解析整部
   const info = await resolvePlayUrl(target.id);
   if (info.mix && info.mix.mix_id) {
     log('[result] 作品属于合集 ' + info.mix.mix_id + ' 「' + (info.mix.mix_name || '') + '」，改为解析整部');
-    return finish(await readPage(`https://www.douyin.com/collection/${info.mix.mix_id}`, info.mix.mix_id, info.mix.mix_name, true));
+    return finish(await readPage([`https://www.douyin.com/collection/${info.mix.mix_id}`], info.mix.mix_id, info.mix.mix_name, true));
   }
 
   log('[result] 单作品（无归属合集）');

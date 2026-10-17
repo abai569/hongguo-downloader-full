@@ -3,7 +3,9 @@ import './DouyinDownload.css';
 import { Music, Download, CheckSquare, Square, RefreshCw, Folder, Link2, Image as ImageIcon, Film } from './icons';
 
 const STAGE_TEXT = {
-  opening: '正在打开合集页…',
+  opening: '正在识别链接…',
+  window: '正在打开抖音页面…',
+  loaded: (p) => (p.found > 0 ? `已发现 ${p.found} 个作品` : '页面已加载，等待接口返回…'),
   page: (p) => `已读取 ${p.pages || 0} 页，发现 ${p.found || 0} 个作品`,
   scroll: (p) => `已发现 ${p.found || 0} 个作品，正在加载更多…`,
   detail: (p) => `正在补全直链 ${p.found || 0} 个…`,
